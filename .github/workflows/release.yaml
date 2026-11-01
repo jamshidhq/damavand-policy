@@ -1,0 +1,37 @@
+name: Release
+
+# Label-driven release on merge (see jamshidhq/actions README).
+#
+# TODO(crates.io): publish is off. The owner does the first crates.io publish
+# of damavand-policy by hand with an API token, then adds a trusted publisher
+# in the crate's crates.io settings (repository jamshidhq/damavand-policy,
+# workflow filename "release.yaml", no environment), then sets
+# `publish: true` below.
+#
+# No concurrency group here: rust-release.yaml holds
+# jamshidhq-rust-release-<owner>/<repo> itself, and the same group on the
+# caller would deadlock the release.
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Merged PR to release"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    permissions:
+      contents: write        # tag, release, bump branch
+      pull-requests: write   # bump PR
+      id-token: write        # crates.io trusted publishing (unused while publish is false)
+    uses: jamshidhq/actions/.github/workflows/rust-release.yaml@47757dce8382731f5d47196380b74eec8e4afefe  # main, 2026-11-01
+    with:
+      pr_number: ${{ github.event.pull_request.number || inputs.pr_number }}
+      publish: false
