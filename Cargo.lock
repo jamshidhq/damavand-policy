@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "damavand-policy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cedar-policy",
  "ed25519-dalek",
