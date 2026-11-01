@@ -1,0 +1,49 @@
+// Damavand schema v1: shared by jamshid and the DevOps agent.
+namespace Damavand {
+  type Budget = { tokens_left: Long, actions_left: Long };
+  type Ctx = {
+    autonomy: Long,
+    action_class: String,
+    taint_unvalidated: Bool,
+    tainted_params: Set<String>,
+    budget: Budget,
+    run_id: String,
+  };
+
+  entity Project;
+  entity Loop in [Project];
+  entity Orchestrator in [Orchestrator, Project] { depth: String };
+  entity Worker in [Orchestrator, Loop];
+  entity User;
+  entity Repo in [Project];
+  entity Path in [Repo];
+  entity Host;
+  entity Cluster;
+  entity K8sNamespace in [Cluster];
+  entity K8sObject in [K8sNamespace];
+  entity SecretRef in [Project];
+  entity Tool;
+  entity NamedCommand in [Repo];
+
+  action "class:read", "class:draft", "class:write.worktree", "class:write.remote",
+         "class:egress", "class:k8s.mutate", "class:secret.use", "class:never";
+
+  action j_read in ["class:read"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [Path, Repo], context: Ctx };
+  action j_edit in ["class:write.worktree"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [Path], context: Ctx };
+  action draft_pr in ["class:draft"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [Repo], context: Ctx };
+  action run_command in ["class:write.worktree"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [NamedCommand], context: Ctx };
+  action git_push in ["class:write.remote"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [Repo], context: Ctx };
+  action http_request in ["class:egress"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [Host], context: Ctx };
+  action k8s_apply in ["class:k8s.mutate"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [K8sObject], context: Ctx };
+  action use_secret in ["class:secret.use"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [SecretRef], context: Ctx };
+  action terraform_apply in ["class:never"] appliesTo {
+    principal: [Worker, Orchestrator, User], resource: [Repo], context: Ctx };
+}

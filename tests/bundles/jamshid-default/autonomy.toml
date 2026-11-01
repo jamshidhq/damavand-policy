@@ -1,0 +1,13 @@
+# Autonomy caps per (project or loop, action class): 0-3.
+# A class with no entry is capped at 0. The effective level is the lowest of
+# every matching cap and the caller's override.
+
+[project.jamshid]
+read = 3
+draft = 3
+"write.worktree" = 3
+"write.remote" = 2
+egress = 1
+
+[loop.nightly]
+"write.worktree" = 1

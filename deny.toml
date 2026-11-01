@@ -1,0 +1,41 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.8
+# Licences allowed for one crate only, so a new crate cannot pull them in
+# unreviewed.
+exceptions = [
+  # serde_json, via cedar-policy's hashbrown.
+  { crate = "foldhash", allow = ["Zlib"] },
+  # Build-time, via psm/stacker in cedar-policy-core.
+  { crate = "ar_archive_writer", allow = ["Apache-2.0 WITH LLVM-exception"] },
+  # Ed25519 grant signatures.
+  { crate = "ed25519-dalek", allow = ["BSD-3-Clause"] },
+  { crate = "curve25519-dalek", allow = ["BSD-3-Clause"] },
+  { crate = "subtle", allow = ["BSD-3-Clause"] },
+]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+# Duplicates that all come from cedar-policy 4.14.0's own tree. They cannot be
+# unified from here; drop each skip when cedar-policy moves.
+skip = [
+  # lalrpop (cedar-policy-core build-dep) pins itertools 0.14; cedar uses 0.15.
+  { crate = "itertools@0.14.0", reason = "lalrpop build-dep of cedar-policy-core" },
+  # logos-codegen (cedar-policy-core) still on syn 2; serde_derive is on syn 3.
+  { crate = "syn@2.0.119", reason = "logos-codegen proc-macro in cedar-policy-core" },
+  # miette 7 (cedar diagnostics) on unicode-width 0.1; pretty on 0.2.
+  { crate = "unicode-width@0.1.14", reason = "miette in cedar-policy" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

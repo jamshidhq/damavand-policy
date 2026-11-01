@@ -1,0 +1,6 @@
+# Pinned toolchain, same as jamshidhq/jamshid. CI (rustup) and local rustup
+# builds use the same rustc/clippy.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

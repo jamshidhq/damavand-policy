@@ -1,0 +1,40 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.0.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, refactor, ci, docs, test, chore, build, perf]
+
+  # Shared hooks. `rev` is the COMMIT of an immutable tag: pre-commit never
+  # re-resolves a rev after first install. cargo-deny, gitleaks and actionlint
+  # refuse a local binary whose version that rev's versions.yaml does not pin
+  # (cargo-deny 0.20.2, gitleaks 8.30.1, actionlint 1.7.12); rust-ci.yaml
+  # installs exactly those.
+  - repo: https://github.com/yadgarhq/actions
+    rev: e6e6a22f1ba449d9113642efcece667366ddc8e5  # v1.47.0
+    hooks:
+      - id: cargo-fmt
+      - id: cargo-clippy
+      - id: cargo-deny
+      - id: gitleaks
+      - id: actionlint
+
+  - repo: local
+    hooks:
+      - id: typos
+        name: typos
+        entry: typos
+        language: system
+        pass_filenames: false

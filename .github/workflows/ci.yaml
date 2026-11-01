@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+# Cancel superseded runs on the same PR (push storms, label flips).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+    uses: jamshidhq/actions/.github/workflows/rust-ci.yaml@47757dce8382731f5d47196380b74eec8e4afefe  # main, 2026-11-01
+    with:
+      feature_args: "--all-features"

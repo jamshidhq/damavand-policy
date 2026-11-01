@@ -1,0 +1,9 @@
+# Every class of the ops project is capped at L0.
+[project.ops]
+read = 0
+draft = 0
+"write.worktree" = 0
+"write.remote" = 0
+egress = 0
+"k8s.mutate" = 0
+"secret.use" = 0
