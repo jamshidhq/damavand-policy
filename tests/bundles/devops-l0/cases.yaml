@@ -12,26 +12,26 @@ x-t1: &t1 {type: Worker, id: t1}
 
 cases:
   - name: L0 loop reads
-    request: {principal: *t1, action: j_read, resource: {type: Path, id: "ops-runbooks/README.md"}, entities: *ents}
+    request: {now: 1800000000, principal: *t1, action: j_read, resource: {type: Path, id: "ops-runbooks/README.md"}, entities: *ents}
     expect: {outcome: allow, notify: false}
 
   - name: permitted k8s apply is denied at L0
-    request: {principal: *t1, action: k8s_apply, resource: {type: K8sObject, id: "prod/deploy/api"}, entities: *ents}
+    request: {now: 1800000000, principal: *t1, action: k8s_apply, resource: {type: K8sObject, id: "prod/deploy/api"}, entities: *ents}
     expect: {outcome: deny, rule: damavand.autonomy}
 
   - name: a user grant cannot lift an L0 deny
-    request: {principal: *t1, action: k8s_apply, resource: {type: K8sObject, id: "prod/deploy/api"}, entities: *ents}
+    request: {now: 1800000000, principal: *t1, action: k8s_apply, resource: {type: K8sObject, id: "prod/deploy/api"}, entities: *ents}
     grantFrom: user
     expect: {outcome: deny, rule: damavand.autonomy}
 
   - name: secret use is forbidden by policy
-    request: {principal: *t1, action: use_secret, resource: {type: SecretRef, id: db-password}, entities: *ents}
+    request: {now: 1800000000, principal: *t1, action: use_secret, resource: {type: SecretRef, id: db-password}, entities: *ents}
     expect: {outcome: deny, rule: global.no-secrets}
 
   - name: draft is denied at L0
-    request: {principal: *t1, action: draft_pr, resource: {type: Repo, id: ops-runbooks}, entities: *ents}
+    request: {now: 1800000000, principal: *t1, action: draft_pr, resource: {type: Repo, id: ops-runbooks}, entities: *ents}
     expect: {outcome: deny, rule: damavand.autonomy}
 
   - name: no match is still denied at L0
-    request: {principal: *t1, action: http_request, resource: {type: Host, id: example.com}, entities: *ents}
+    request: {now: 1800000000, principal: *t1, action: http_request, resource: {type: Host, id: example.com}, entities: *ents}
     expect: {outcome: deny, rule: damavand.autonomy}

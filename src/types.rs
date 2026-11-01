@@ -4,16 +4,88 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// The id of a policy bundle: the git commit sha it was loaded from.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct BundleId(pub String);
-
-impl fmt::Display for BundleId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
+/// Lower-case hex of a byte string.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Parse exactly `N` bytes of hex.
+pub(crate) fn unhex<const N: usize>(s: &str) -> Result<[u8; N], String> {
+    if s.len() != 2 * N || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("expected {} hex characters", 2 * N));
+    }
+    let mut out = [0u8; N];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[i] = u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// A fixed-size byte string that travels as lower-case hex.
+macro_rules! hex_bytes {
+    ($(#[$doc:meta])* $name:ident, $n:literal) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub struct $name(pub [u8; $n]);
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&hex(&self.0))
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, String> {
+                unhex::<$n>(s).map($name)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(&self.to_string())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(d)?;
+                s.parse().map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+hex_bytes!(
+    /// The id of a loaded bundle: SHA-256 over its canonical content
+    /// (schema, policy files by name, autonomy caps, constraints, broker
+    /// keys). [`crate::Engine::load`] computes it; the human label (a commit
+    /// sha) is kept apart.
+    BundleId,
+    32
+);
+hex_bytes!(
+    /// SHA-256 digest of a request's principal, action, resource and
+    /// parameters (names, values and taint).
+    RequestDigest,
+    32
+);
+hex_bytes!(
+    /// A grant's single-use nonce. The core consumes it; see [`Grant`].
+    GrantNonce,
+    16
+);
+hex_bytes!(
+    /// An Ed25519 signature by the approval broker.
+    GrantSignature,
+    64
+);
+hex_bytes!(
+    /// An approval broker's Ed25519 public key.
+    BrokerKey,
+    32
+);
 
 /// The id of the rule that determined a decision: a policy's `@id`, or a
 /// built-in `damavand.*` rule.
@@ -32,6 +104,9 @@ impl RuleId {
     pub const UNKNOWN_ACTION: &'static str = "damavand.unknown_action";
     /// Built-in rule: the request does not match the bundle schema.
     pub const REQUEST_INVALID: &'static str = "damavand.request_invalid";
+    /// Built-in rule: the principal's topology (orchestrator depth, worker
+    /// placement) is not one the core can build.
+    pub const TOPOLOGY: &'static str = "damavand.topology";
 
     /// The rule id as text.
     pub fn as_str(&self) -> &str {
@@ -105,13 +180,14 @@ impl Entity {
     }
 }
 
-/// Where a parameter value came from.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Where a parameter value came from. Required on the wire: a parameter
+/// without `taint` does not deserialize, so a forgetful producer cannot make
+/// a value trusted by omission. There is no `Default`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub enum Taint {
     /// From the user or the policy bundle.
-    #[default]
     Clean,
     /// From anything else: repo files, tool output, web content.
     Untrusted {
@@ -121,33 +197,21 @@ pub enum Taint {
     },
 }
 
-/// A manifest constraint that clears a tainted parameter when its value
-/// matches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub enum ParamConstraint {
-    /// The value must equal one of these strings.
-    Enum(Vec<String>),
-    /// The whole value must match this regex (`regex` crate syntax). The
-    /// engine anchors it; an invalid or oversized pattern clears nothing.
-    Pattern(String),
-}
-
 /// One parameter of the proposed action.
+///
+/// Constraints that clear taint live in the bundle (`constraints.toml`),
+/// keyed by action and parameter name. A request cannot carry one: unknown
+/// fields, `constraint` included, are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Param {
     /// Parameter name.
     pub name: String,
     /// Parameter value.
     pub value: String,
-    /// Provenance of the value.
-    #[serde(default)]
+    /// Provenance of the value. Required.
     pub taint: Taint,
-    /// Manifest constraint, if the manifest declares one.
-    #[serde(default)]
-    pub constraint: Option<ParamConstraint>,
 }
 
 impl Param {
@@ -157,7 +221,6 @@ impl Param {
             name: name.into(),
             value: value.into(),
             taint: Taint::Clean,
-            constraint: None,
         }
     }
 
@@ -171,14 +234,7 @@ impl Param {
             name: name.into(),
             value: value.into(),
             taint: Taint::Untrusted { sources },
-            constraint: None,
         }
-    }
-
-    /// Set the manifest constraint.
-    pub fn with_constraint(mut self, constraint: ParamConstraint) -> Self {
-        self.constraint = Some(constraint);
-        self
     }
 }
 
@@ -266,16 +322,18 @@ pub enum ActionClass {
 
 impl ActionClass {
     /// Every class.
-    pub const ALL: [ActionClass; 8] = [
-        ActionClass::Read,
-        ActionClass::Draft,
-        ActionClass::WriteWorktree,
-        ActionClass::WriteRemote,
-        ActionClass::Egress,
-        ActionClass::K8sMutate,
-        ActionClass::SecretUse,
-        ActionClass::Never,
-    ];
+    pub fn all() -> &'static [ActionClass] {
+        &[
+            ActionClass::Read,
+            ActionClass::Draft,
+            ActionClass::WriteWorktree,
+            ActionClass::WriteRemote,
+            ActionClass::Egress,
+            ActionClass::K8sMutate,
+            ActionClass::SecretUse,
+            ActionClass::Never,
+        ]
+    }
 
     /// The class name without the `class:` prefix.
     pub fn name(self) -> &'static str {
@@ -293,13 +351,16 @@ impl ActionClass {
 
     /// The class for a name without the `class:` prefix.
     pub fn from_name(name: &str) -> Option<Self> {
-        ActionClass::ALL.into_iter().find(|c| c.name() == name)
+        ActionClass::all()
+            .iter()
+            .copied()
+            .find(|c| c.name() == name)
     }
 }
 
 /// Remaining budget, passed to policies as context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Budget {
     /// Tokens left in the run.
@@ -331,74 +392,58 @@ pub enum Approver {
     User,
 }
 
-/// SHA-256 digest of a request's principal, action, resource and parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequestDigest(pub [u8; 32]);
-
-impl fmt::Display for RequestDigest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::str::FromStr for RequestDigest {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("a request digest is 64 hex characters".into());
-        }
-        let mut out = [0u8; 32];
-        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
-            let hex = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
-            out[i] = u8::from_str_radix(hex, 16).map_err(|e| e.to_string())?;
-        }
-        Ok(RequestDigest(out))
-    }
-}
-
-impl Serialize for RequestDigest {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for RequestDigest {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        s.parse().map_err(serde::de::Error::custom)
-    }
-}
-
 /// An approval, re-sent with the request it approves.
 ///
-/// The caller authenticates the approver; the engine checks only the digest
-/// and that the approver is high enough for the escalation.
+/// An approval broker in the core signs it with Ed25519 over
+/// [`crate::grant_signing_bytes`]: the bundle id, run id, request digest,
+/// entities digest, the escalation's full reason list, the approver,
+/// `expires_at` and the nonce. The engine holds only the broker's public
+/// keys (from the bundle) and recomputes every bound field from the request
+/// and its own decision, so a grant for another bundle, run, request,
+/// entity graph or reason does not verify.
+///
+/// The engine is stateless and cannot see a replay of the same request.
+/// When a grant lifts an escalation, the Allow carries the nonce
+/// ([`DecisionRecord::grant_nonce`]); the core must consume it atomically
+/// (insert-if-absent) before acting, and treat a nonce it has seen as Deny.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Grant {
-    /// Digest of the approved request.
-    pub request_digest: RequestDigest,
     /// Who approved.
     pub approver: Approver,
+    /// Unix seconds; the grant is valid while the request's `now` is less.
+    pub expires_at: u64,
+    /// Single-use nonce, chosen by the broker.
+    pub nonce: GrantNonce,
+    /// The broker's signature.
+    pub signature: GrantSignature,
 }
 
 impl Grant {
-    /// Make a grant.
-    pub fn new(request_digest: RequestDigest, approver: Approver) -> Self {
+    /// Make a grant from its signed parts.
+    pub fn new(
+        approver: Approver,
+        expires_at: u64,
+        nonce: GrantNonce,
+        signature: GrantSignature,
+    ) -> Self {
         Self {
-            request_digest,
             approver,
+            expires_at,
+            nonce,
+            signature,
         }
     }
 }
 
 /// A request for a decision.
+///
+/// The core builds it. The entity graph (orchestrator depth, loop and
+/// project membership) comes from the core's state machine, never from
+/// agent input; see `docs/design.md` section 0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct DecisionRequest {
     /// Who acts.
@@ -422,6 +467,9 @@ pub struct DecisionRequest {
     /// Run id, passed to policies as context.
     #[serde(default)]
     pub run_id: String,
+    /// Current time, Unix seconds, from the core's clock. Required: grant
+    /// expiry is checked against it, so `decide` stays deterministic.
+    pub now: u64,
     /// An approval for this request.
     #[serde(default)]
     pub approval: Option<Grant>,
@@ -429,7 +477,13 @@ pub struct DecisionRequest {
 
 impl DecisionRequest {
     /// Make a request with no entities, parameters, override or approval.
-    pub fn new(principal: EntityRef, action: impl Into<String>, resource: EntityRef) -> Self {
+    /// `now` is the core's clock in Unix seconds.
+    pub fn new(
+        principal: EntityRef,
+        action: impl Into<String>,
+        resource: EntityRef,
+        now: u64,
+    ) -> Self {
         Self {
             principal,
             action: action.into(),
@@ -439,6 +493,7 @@ impl DecisionRequest {
             autonomy_override: None,
             budget: Budget::default(),
             run_id: String::new(),
+            now,
             approval: None,
         }
     }
@@ -479,16 +534,16 @@ impl DecisionRequest {
         self
     }
 
-    /// The digest an approval of this request must carry. It covers the
-    /// principal, action, resource and every parameter name and value, in
-    /// order.
+    /// The request digest: principal, action, resource and every parameter
+    /// name, value and taint, in order. A grant signs it (with much more);
+    /// knowing it does not let anyone make a grant.
     pub fn digest(&self) -> RequestDigest {
         crate::gates::request_digest(self)
     }
 }
 
 /// Why a request escalates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EscalateReason {
     /// No permit matched (precedence tier 5, "ask").
@@ -497,8 +552,20 @@ pub enum EscalateReason {
     PolicyAsk(RuleId),
     /// Autonomy L2: the action needs approval.
     AutonomyRequiresApproval,
-    /// This tainted parameter matched no manifest constraint.
+    /// This tainted parameter matched no bundle constraint.
     TaintedParam(String),
+}
+
+impl EscalateReason {
+    /// Severity for ordering: TaintedParam > PolicyAsk > Autonomy > NoMatch.
+    pub fn severity(&self) -> u8 {
+        match self {
+            EscalateReason::TaintedParam(_) => 3,
+            EscalateReason::PolicyAsk(_) => 2,
+            EscalateReason::AutonomyRequiresApproval => 1,
+            EscalateReason::NoMatch => 0,
+        }
+    }
 }
 
 /// Audit data for one decision.
@@ -516,6 +583,9 @@ pub struct DecisionRecord {
     pub request_digest: RequestDigest,
     /// True when an approval lifted an escalation to Allow.
     pub approved: bool,
+    /// The nonce of the grant that lifted the escalation. The core must
+    /// consume it atomically before it acts; a nonce seen before is Deny.
+    pub grant_nonce: Option<GrantNonce>,
 }
 
 /// The decision for a request.
@@ -538,8 +608,8 @@ pub enum Decision {
     },
     /// The action needs an approval first.
     Escalate {
-        /// Why.
-        reason: EscalateReason,
+        /// Every reason, most severe first. A grant signs all of them.
+        reasons: Vec<EscalateReason>,
         /// Who must approve.
         to: Approver,
         /// Audit data.

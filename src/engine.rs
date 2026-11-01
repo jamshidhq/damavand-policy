@@ -4,23 +4,45 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 
 use cedar_policy::{
-    Authorizer, Context, Decision as CedarDecision, Effect, Entities, EntityId, EntityTypeName,
-    EntityUid, PolicyId, PolicySet, Request, ResourceConstraint, Schema, ValidationMode, Validator,
+    ActionConstraint, Authorizer, Context, Decision as CedarDecision, Effect, Entities, EntityId,
+    EntityTypeName, EntityUid, PolicyId, PolicySet, Request, ResourceConstraint, Schema,
+    ValidationMode, Validator,
 };
+use ed25519_dalek::VerifyingKey;
 use serde_json::{Value, json};
 
 use crate::bundle::{Bundle, LoadError, PolicyFile};
 use crate::gates::{
-    Verdict, autonomy_verdict, effective_autonomy, grant_lifts, meet, uncleared_tainted,
+    Constraint, Constraints, PatternError, Verdict, autonomy_verdict, compile_pattern,
+    effective_autonomy, meet, uncleared_tainted,
 };
+use crate::grant::{grant_lifts, verifying_key};
 use crate::types::{
     ActionClass, Approver, Autonomy, BundleId, Decision, DecisionRecord, DecisionRequest,
     EntityRef, EscalateReason, RuleId,
 };
 
-/// Built-in Never actions. The engine denies them whatever the bundle says,
-/// and refuses a bundle that puts one in a class other than `class:never`.
-pub const NEVER_ACTIONS: &[&str] = &["terraform_apply"];
+/// Built-in Never actions, defined by name because their danger does not
+/// depend on the bundle. Class `class:never` is the main mechanism; this
+/// list only stops a bundle from moving these verbs out of it. The engine
+/// denies them whatever the bundle says, and refuses a bundle that puts one
+/// in a class other than `class:never`.
+pub const NEVER_ACTIONS: &[&str] = &[
+    "terraform_apply",
+    "terraform_destroy",
+    "terraform_import",
+    "tofu_apply",
+    "tofu_destroy",
+    "tofu_import",
+];
+
+/// The global forbid the loader adds to every bundle whose schema has
+/// `class:never`.
+const NEVER_FORBID: &str =
+    r#"forbid (principal, action in Damavand::Action::"class:never", resource);"#;
+
+/// Orchestrator depths the core builds.
+const DEPTHS: &[&str] = &["main", "child"];
 
 const NAMESPACE: &str = "Damavand";
 const CLASS_PREFIX: &str = "class:";
@@ -123,6 +145,9 @@ struct Meta {
 #[derive(Debug)]
 pub struct Engine {
     bundle_id: BundleId,
+    label: String,
+    constraints: Constraints,
+    broker_keys: Vec<VerifyingKey>,
     schema: Schema,
     policies: PolicySet,
     meta: HashMap<PolicyId, Meta>,
@@ -150,6 +175,65 @@ fn action_uid(name: &str) -> Option<EntityUid> {
 
 fn is_damavand_action(u: &EntityUid) -> bool {
     u.type_name().to_string() == format!("{NAMESPACE}::Action")
+}
+
+/// `[a-z][a-z0-9_.]*`
+fn valid_action_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+}
+
+/// Parse `constraints.toml` against the classified actions and compile
+/// every pattern.
+fn parse_constraints(
+    text: &str,
+    classes: &HashMap<String, ActionClass>,
+) -> Result<Constraints, LoadError> {
+    let bad = |message: String| LoadError::Constraints { message };
+    let table: toml::Table = toml::from_str(text).map_err(|e| bad(e.message().to_string()))?;
+    let mut out = Constraints::new();
+    for (action, params) in table {
+        if !classes.contains_key(&action) {
+            return Err(bad(format!("unknown action {action:?}")));
+        }
+        let params = params
+            .as_table()
+            .ok_or_else(|| bad(format!("[{action}] must hold tables")))?;
+        for (param, entry) in params {
+            let shape = || bad(format!("[{action}.{param}]: use one enum or one pattern"));
+            let entry = entry.as_table().ok_or_else(shape)?;
+            if entry.len() != 1 {
+                return Err(shape());
+            }
+            let c = match (entry.get("enum"), entry.get("pattern")) {
+                (Some(toml::Value::Array(items)), None) if !items.is_empty() => {
+                    let choices = items
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_string))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(shape)?;
+                    Constraint::Enum(choices)
+                }
+                (None, Some(toml::Value::String(p))) => {
+                    let err = |e| match e {
+                        PatternError::Invalid => LoadError::PatternInvalid {
+                            action: action.clone(),
+                            param: param.clone(),
+                        },
+                        PatternError::TooBroad => LoadError::PatternTooBroad {
+                            action: action.clone(),
+                            param: param.clone(),
+                        },
+                    };
+                    Constraint::Pattern(compile_pattern(p).map_err(err)?)
+                }
+                _ => return Err(shape()),
+            };
+            out.insert((action.clone(), param.clone()), c);
+        }
+    }
+    Ok(out)
 }
 
 /// The context record the engine sends; `load` checks every action accepts it.
@@ -183,12 +267,32 @@ impl Engine {
         let mut policies = PolicySet::new();
         let mut meta = HashMap::new();
         for file in &bundle.global {
-            Self::add_file(&mut policies, &mut meta, file, None)?;
+            Self::add_file(&mut policies, &mut meta, file, None, &classes)?;
         }
         for (project, files) in &bundle.projects {
             for file in files {
-                Self::add_file(&mut policies, &mut meta, file, Some(project))?;
+                Self::add_file(&mut policies, &mut meta, file, Some(project), &classes)?;
             }
+        }
+        // Never as a global forbid, next to the Rust gate in decide().
+        let never_group = action_uid(&format!("{CLASS_PREFIX}never"));
+        if schema.actions().any(|a| Some(a) == never_group.as_ref()) {
+            let forbid = PolicySet::from_str(NEVER_FORBID)
+                .ok()
+                .and_then(|p| p.policies().next().cloned())
+                .ok_or(LoadError::Schema)?;
+            let pid = PolicyId::new(RuleId::NEVER);
+            policies
+                .add(forbid.new_id(pid.clone()))
+                .map_err(|_| LoadError::Schema)?;
+            meta.insert(
+                pid,
+                Meta {
+                    tier: Tier::Global,
+                    rule: RuleId(RuleId::NEVER.into()),
+                    ask: false,
+                },
+            );
         }
 
         let result = Validator::new(schema.clone()).validate(&policies, ValidationMode::Strict);
@@ -203,8 +307,18 @@ impl Engine {
         }
 
         let caps = AutonomyCaps::parse(&bundle.autonomy)?;
+        let constraints = parse_constraints(&bundle.constraints, &classes)?;
+        let broker_keys = bundle
+            .broker_keys
+            .iter()
+            .enumerate()
+            .map(|(index, k)| verifying_key(k).ok_or(LoadError::BrokerKey { index }))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Engine {
-            bundle_id: bundle.id.clone(),
+            bundle_id: bundle.digest(),
+            label: bundle.label.clone(),
+            constraints,
+            broker_keys,
             schema,
             policies,
             meta,
@@ -245,6 +359,9 @@ impl Engine {
                 }
                 continue;
             }
+            if !valid_action_id(&id) {
+                return Err(LoadError::ActionId { action: id });
+            }
             if groups.contains(a) {
                 continue;
             }
@@ -259,7 +376,8 @@ impl Engine {
             if NEVER_ACTIONS.contains(&id.as_str()) && class != ActionClass::Never {
                 return Err(LoadError::NeverReclassified { action: id });
             }
-            let sample = DecisionRequest::new(EntityRef::new("", ""), "", EntityRef::new("", ""));
+            let sample =
+                DecisionRequest::new(EntityRef::new("", ""), "", EntityRef::new("", ""), 0);
             let ctx = context_json(Autonomy::L0Observe, class, &sample, &["p"]);
             if Context::from_json_value(ctx, Some((schema, a))).is_err() {
                 return Err(LoadError::ContextShape { action: id });
@@ -274,6 +392,7 @@ impl Engine {
         meta: &mut HashMap<PolicyId, Meta>,
         file: &PolicyFile,
         project: Option<&String>,
+        classes: &HashMap<String, ActionClass>,
     ) -> Result<(), LoadError> {
         let parsed = PolicySet::from_str(&file.text).map_err(|_| LoadError::Parse {
             file: file.name.clone(),
@@ -297,6 +416,24 @@ impl Engine {
             };
             if id.starts_with("damavand.") {
                 return Err(LoadError::ReservedId { id });
+            }
+            if policy.effect() == Effect::Permit {
+                let scope = policy.action_constraint();
+                let named: Vec<&EntityUid> = match &scope {
+                    ActionConstraint::Any => Vec::new(),
+                    ActionConstraint::Eq(u) => vec![u],
+                    ActionConstraint::In(us) => us.iter().collect(),
+                };
+                let never = |u: &&EntityUid| {
+                    let name = u.id().unescaped();
+                    is_damavand_action(u)
+                        && (name == "class:never"
+                            || NEVER_ACTIONS.contains(&name)
+                            || classes.get(name) == Some(&ActionClass::Never))
+                };
+                if named.iter().any(never) {
+                    return Err(LoadError::PermitsNever { id });
+                }
             }
             let ask = match policy.annotation("outcome") {
                 None => false,
@@ -347,10 +484,11 @@ impl Engine {
         let digest = req.digest();
         let mut record = DecisionRecord {
             decision_id: uuid::Uuid::now_v7().to_string(),
-            bundle_id: self.bundle_id.clone(),
+            bundle_id: self.bundle_id,
             rule_ids: Vec::new(),
             request_digest: digest,
             approved: false,
+            grant_nonce: None,
         };
         let builtin = |rule: &str, mut record: DecisionRecord| {
             record.rule_ids = vec![RuleId(rule.into())];
@@ -374,6 +512,9 @@ impl Engine {
         let Some((request, entities, level)) = self.cedar_request(req, class) else {
             return builtin(RuleId::REQUEST_INVALID, record);
         };
+        if !Self::topology_ok(req, &entities) {
+            return builtin(RuleId::TOPOLOGY, record);
+        }
         let response = Authorizer::new().is_authorized(&request, &self.policies, &entities);
         // Cedar skips a policy that errors; a skipped forbid must not fail open.
         if response.diagnostics().errors().next().is_some() {
@@ -396,34 +537,75 @@ impl Engine {
                 if let Some(hard) = determining.iter().find(|m| !m.ask) {
                     Verdict::Deny(hard.rule.clone())
                 } else if let Some(ask) = determining.first() {
-                    Verdict::Escalate(EscalateReason::PolicyAsk(ask.rule.clone()), Approver::User)
+                    Verdict::Escalate(
+                        vec![EscalateReason::PolicyAsk(ask.rule.clone())],
+                        Approver::User,
+                    )
                 } else {
-                    Verdict::Escalate(EscalateReason::NoMatch, self.next_level(req))
+                    Verdict::Escalate(vec![EscalateReason::NoMatch], self.next_level(req))
                 }
             }
         };
-        let tainted = uncleared_tainted(&req.params);
-        let taint = match tainted.first() {
-            Some(name) => Verdict::Escalate(
-                EscalateReason::TaintedParam(name.to_string()),
-                Approver::User,
-            ),
-            None => Verdict::Allow { notify: false },
+        let tainted = uncleared_tainted(&req.params, &req.action, &self.constraints);
+        let taint = if tainted.is_empty() {
+            Verdict::Allow { notify: false }
+        } else {
+            let reasons = tainted
+                .iter()
+                .map(|n| EscalateReason::TaintedParam(n.to_string()))
+                .collect();
+            Verdict::Escalate(reasons, Approver::User)
         };
         let mut verdict = meet(meet(cedar, autonomy_verdict(class, level)), taint);
 
         // A grant lifts Escalate only. It is never consulted for Deny.
-        if let (Verdict::Escalate(_, to), Some(grant)) = (&verdict, &req.approval)
-            && grant_lifts(&grant.request_digest, grant.approver, &digest, *to)
+        if let (Verdict::Escalate(reasons, to), Some(grant)) = (&verdict, &req.approval)
+            && grant_lifts(&self.broker_keys, &self.bundle_id, req, grant, reasons, *to)
         {
             verdict = Verdict::Allow { notify: true };
             record.approved = true;
+            record.grant_nonce = Some(grant.nonce);
         }
         match verdict {
             Verdict::Deny(rule) => Decision::Deny { rule, record },
-            Verdict::Escalate(reason, to) => Decision::Escalate { reason, to, record },
+            Verdict::Escalate(reasons, to) => Decision::Escalate {
+                reasons,
+                to,
+                record,
+            },
             Verdict::Allow { notify } => Decision::Allow { notify, record },
         }
+    }
+
+    /// The topology checks the engine can make on what the core sent: every
+    /// orchestrator has a known depth, and a worker principal is in an
+    /// orchestrator or a loop. Loop membership itself is the core's to get
+    /// right; an omitted Loop edge is not visible here.
+    fn topology_ok(req: &DecisionRequest, entities: &Entities) -> bool {
+        let orchestrator = qualify("Orchestrator");
+        let depths_ok = req
+            .entities
+            .iter()
+            .filter(|e| qualify(&e.uid.kind) == orchestrator)
+            .all(|e| {
+                e.attrs
+                    .get("depth")
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| DEPTHS.contains(&d))
+            });
+        if !depths_ok {
+            return false;
+        }
+        if qualify(&req.principal.kind) != qualify("Worker") {
+            return true;
+        }
+        let Some(principal) = uid(&req.principal) else {
+            return false;
+        };
+        let placed = [orchestrator, qualify("Loop")];
+        entities
+            .ancestors(&principal)
+            .is_some_and(|mut a| a.any(|p| placed.contains(&p.type_name().to_string())))
     }
 
     /// Build the Cedar request and entity store, and the effective autonomy
@@ -457,7 +639,7 @@ impl Engine {
             self.cap(&entities, &principal, class),
             req.autonomy_override,
         );
-        let tainted = uncleared_tainted(&req.params);
+        let tainted = uncleared_tainted(&req.params, &req.action, &self.constraints);
         let ctx = Context::from_json_value(
             context_json(level, class, req, &tainted),
             Some((&self.schema, &action)),
@@ -527,9 +709,14 @@ impl Engine {
         }
     }
 
-    /// The id of the loaded bundle.
+    /// The id of the loaded bundle: SHA-256 over its canonical content.
     pub fn bundle_id(&self) -> &BundleId {
         &self.bundle_id
+    }
+
+    /// The bundle's human label (a commit sha).
+    pub fn bundle_label(&self) -> &str {
+        &self.label
     }
 
     /// The autonomy caps from `autonomy.toml`.

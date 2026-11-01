@@ -17,36 +17,58 @@ in Rust. A classifier has no input, so it can never allow.
 ## How a decision is made
 
 ```rust
-use damavand_policy::{Bundle, BundleId, DecisionRequest, Engine, EntityRef};
+use damavand_policy::{Bundle, DecisionRequest, Engine, EntityRef};
 
-let bundle = Bundle::from_dir("policy".as_ref(), BundleId("<commit sha>".into()))?;
+let bundle = Bundle::from_dir("policy".as_ref(), "<commit sha>")?;
 let engine = Engine::load(&bundle)?; // strict validation; refuses bad bundles
 let req = DecisionRequest::new(
     EntityRef::new("Worker", "w1"),
     "j_edit",
     EntityRef::new("Path", "jamshid/src/lib.rs"),
+    now_unix_seconds, // the core's clock; required
 );
 let decision = engine.decide(&req); // infallible, fails closed
 ```
 
 `decide` returns `Allow { notify }`, `Deny { rule }` or
-`Escalate { reason, to }`, each with a `DecisionRecord` (UUIDv7, bundle id,
-rule ids, request digest). The outcome is the meet, weakest wins
+`Escalate { reasons, to }`, each with a `DecisionRecord` (UUIDv7, bundle id,
+rule ids, request digest, grant nonce). The outcome is the meet, weakest wins
 (Deny < Escalate < Allow with notify < Allow), of:
 
 | Part | Rule |
 | --- | --- |
 | Cedar | Forbid beats permit. No permit → `Escalate(NoMatch)` up worker → child → main → user. Only `@outcome("ask")` forbids → `Escalate(PolicyAsk)` to the user. Any evaluation error → `Deny(damavand.eval_error)`. |
 | Autonomy | Effective level = min(git cap, caller override). L0: read only. L1: plus draft. L2: escalate to the user. L3: allow and notify. |
-| Taint | An untrusted parameter that its manifest enum or anchored regex does not clear → `Escalate(TaintedParam)` to the user. |
+| Taint | `taint` is required on every parameter. An untrusted parameter that the bundle's enum or anchored regex for (action, parameter) does not clear → `Escalate(TaintedParam)` to the user. A request cannot carry a constraint. |
 
-Never actions (`class:never`, and the built-in `NEVER_ACTIONS`) are denied
-before Cedar runs. A `Grant` bound to the request digest lifts Escalate to
-Allow, never Deny, and only when the approver ranks high enough.
+Escalations list every reason, most severe first (TaintedParam > PolicyAsk >
+AutonomyRequiresApproval > NoMatch). Never actions (`class:never`, and the
+built-in `NEVER_ACTIONS`) are denied before Cedar runs and by a global
+forbid the loader injects.
+
+## Trust boundary and grants
+
+The core builds every request: the entity graph (orchestrator depth, loop
+and project membership) comes from its state machine, never from agent
+input. The engine refuses topology it cannot have built
+(`damavand.topology`), but it cannot see an edge the core left out.
+
+A `Grant` is an Ed25519 signature by the core's approval broker over
+`grant_signing_bytes`: bundle id, run id, request digest, entities digest,
+all escalation reasons, approver, `expiresAt` and a nonce. The bundle holds
+only the broker's public keys (`approval.toml`). A grant lifts Escalate to
+`Allow { notify: true }`, never Deny, when the signature verifies, the
+approver ranks high enough and the request's `now` is before `expiresAt`.
+
+**Contract for the core:** the engine is stateless. When a grant lifts an
+escalation, the Allow carries the nonce (`record.grant_nonce`, wire
+`grantNonce`). Consume it atomically (insert-if-absent) before acting; a
+nonce already consumed is Deny.
 
 ## Bundle layout
 
-A bundle is a git directory; its id is the commit sha.
+A bundle is a git directory. Its id is SHA-256 over its content
+(`Engine::bundle_id`); the commit sha is a label.
 
 | Path | Contents |
 | --- | --- |
@@ -54,6 +76,8 @@ A bundle is a git directory; its id is the commit sha.
 | `global/*.cedar` | Global policies. Every policy has a unique `@id`. |
 | `projects/<id>/*.cedar` | Project policies, each scoped `resource in Damavand::Project::"<id>"`. |
 | `autonomy.toml` | Caps, `[project.<id>]` / `[loop.<id>]`, class = 0-3. |
+| `constraints.toml` | `[<action>.<param>]` with one `enum = [...]` or one `pattern = "..."` (anchored; refused if it can match a control character or shell metacharacter). |
+| `approval.toml` | `broker_keys = ["<hex Ed25519 public key>"]`. No key, no grant. |
 
 Golden bundles: [tests/bundles](tests/bundles) (`jamshid-default`,
 `devops-l0`), each with its expected decisions in `cases.yaml`.
@@ -79,6 +103,7 @@ run in process (`conformance::run`) or against a server.
 ## Not yet in the crate
 
 - Hot reload, `policy/explain`, signed bundles, budget accounting.
+- Nonce storage: the core owns single use of grant nonces.
 - `mcp_call` with a class from the module manifest.
 - The audit event schema (the audit crate will own it).
 

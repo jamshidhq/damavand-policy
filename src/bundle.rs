@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::Path;
 
-use crate::types::BundleId;
+use sha2::{Digest, Sha256};
+
+use crate::types::{BrokerKey, BundleId};
 
 /// One policy file: its name (for error messages) and its Cedar text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,27 +22,52 @@ pub(crate) struct PolicyFile {
 /// ```text
 /// schema.cedarschema
 /// autonomy.toml          (optional; absent = every cap is L0)
+/// constraints.toml       (optional; absent = no parameter clears taint)
+/// approval.toml          (optional; absent = no grant verifies)
 /// global/*.cedar
 /// projects/<id>/*.cedar
 /// ```
+///
+/// `constraints.toml` maps (action, parameter) to an enum or an anchored
+/// pattern; a match clears that parameter's taint:
+///
+/// ```toml
+/// [j_edit.mode]
+/// enum = ["append", "replace"]
+///
+/// [j_edit.path]
+/// pattern = "[a-z0-9/._-]+"
+/// ```
+///
+/// `approval.toml` lists the approval broker's Ed25519 public keys:
+///
+/// ```toml
+/// broker_keys = ["<64 hex characters>"]
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bundle {
-    pub(crate) id: BundleId,
+    pub(crate) label: String,
     pub(crate) schema: String,
     pub(crate) global: Vec<PolicyFile>,
     pub(crate) projects: BTreeMap<String, Vec<PolicyFile>>,
     pub(crate) autonomy: String,
+    pub(crate) constraints: String,
+    pub(crate) broker_keys: Vec<BrokerKey>,
 }
 
 impl Bundle {
-    /// A bundle with a schema and no policies or caps.
-    pub fn new(id: BundleId, schema: impl Into<String>) -> Self {
+    /// A bundle with a schema and no policies, caps, constraints or broker
+    /// keys. `label` is a human label (a commit sha); the bundle id is a
+    /// content digest computed by [`crate::Engine::load`].
+    pub fn new(label: impl Into<String>, schema: impl Into<String>) -> Self {
         Self {
-            id,
+            label: label.into(),
             schema: schema.into(),
             global: Vec::new(),
             projects: BTreeMap::new(),
             autonomy: String::new(),
+            constraints: String::new(),
+            broker_keys: Vec::new(),
         }
     }
 
@@ -76,28 +103,81 @@ impl Bundle {
         self
     }
 
-    /// The bundle id.
-    pub fn id(&self) -> &BundleId {
-        &self.id
+    /// Set the `constraints.toml` text.
+    pub fn with_constraints(mut self, toml: impl Into<String>) -> Self {
+        self.constraints = toml.into();
+        self
     }
 
-    /// Read a bundle directory. `id` is the commit sha of the checkout.
+    /// Trust an approval broker's public key.
+    pub fn with_broker_key(mut self, key: BrokerKey) -> Self {
+        self.broker_keys.push(key);
+        self
+    }
+
+    /// The human label.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// SHA-256 over the canonical content: every field length-prefixed,
+    /// policy files sorted by name, projects by id. The label is not in it.
+    pub(crate) fn digest(&self) -> BundleId {
+        fn feed(h: &mut Sha256, b: &[u8]) {
+            h.update((b.len() as u64).to_be_bytes());
+            h.update(b);
+        }
+        fn files(h: &mut Sha256, files: &[PolicyFile]) {
+            let mut sorted: Vec<&PolicyFile> = files.iter().collect();
+            sorted.sort_by(|a, b| (&a.name, &a.text).cmp(&(&b.name, &b.text)));
+            h.update((sorted.len() as u64).to_be_bytes());
+            for f in sorted {
+                feed(h, f.name.as_bytes());
+                feed(h, f.text.as_bytes());
+            }
+        }
+        let mut h = Sha256::new();
+        feed(&mut h, b"damavand-policy/bundle/v1");
+        feed(&mut h, self.schema.as_bytes());
+        feed(&mut h, self.autonomy.as_bytes());
+        feed(&mut h, self.constraints.as_bytes());
+        h.update((self.broker_keys.len() as u64).to_be_bytes());
+        for k in &self.broker_keys {
+            feed(&mut h, &k.0);
+        }
+        files(&mut h, &self.global);
+        h.update((self.projects.len() as u64).to_be_bytes());
+        for (id, fs) in &self.projects {
+            feed(&mut h, id.as_bytes());
+            files(&mut h, fs);
+        }
+        BundleId(h.finalize().into())
+    }
+
+    /// Read a bundle directory. `label` is the commit sha of the checkout.
     /// Files are read in name order.
-    pub fn from_dir(dir: &Path, id: BundleId) -> Result<Bundle, LoadError> {
+    pub fn from_dir(dir: &Path, label: impl Into<String>) -> Result<Bundle, LoadError> {
         let read = |p: &Path| {
             std::fs::read_to_string(p).map_err(|e| LoadError::Io {
                 path: p.display().to_string(),
                 message: e.to_string(),
             })
         };
-        let schema = read(&dir.join("schema.cedarschema"))?;
-        let autonomy_path = dir.join("autonomy.toml");
-        let autonomy = if autonomy_path.exists() {
-            read(&autonomy_path)?
-        } else {
-            String::new()
+        let optional = |name: &str| {
+            let p = dir.join(name);
+            if p.exists() {
+                read(&p)
+            } else {
+                Ok(String::new())
+            }
         };
-        let mut bundle = Bundle::new(id, schema).with_autonomy(autonomy);
+        let schema = read(&dir.join("schema.cedarschema"))?;
+        let mut bundle = Bundle::new(label, schema)
+            .with_autonomy(optional("autonomy.toml")?)
+            .with_constraints(optional("constraints.toml")?);
+        for key in parse_approval(&optional("approval.toml")?)? {
+            bundle = bundle.with_broker_key(key);
+        }
         for (name, text) in cedar_files(&dir.join("global"), read)? {
             bundle = bundle.with_global(format!("global/{name}"), text);
         }
@@ -113,6 +193,29 @@ impl Bundle {
         }
         Ok(bundle)
     }
+}
+
+/// `approval.toml`: `broker_keys = ["<hex>", ...]` and nothing else.
+fn parse_approval(text: &str) -> Result<Vec<BrokerKey>, LoadError> {
+    let bad = |message: String| LoadError::Approval { message };
+    let table: toml::Table = toml::from_str(text).map_err(|e| bad(e.message().to_string()))?;
+    let mut keys = Vec::new();
+    for (k, v) in table {
+        if k != "broker_keys" {
+            return Err(bad(format!("unknown key {k:?}")));
+        }
+        let list = v
+            .as_array()
+            .ok_or_else(|| bad("broker_keys must be a list".into()))?;
+        for item in list {
+            let key = item
+                .as_str()
+                .and_then(|s| s.parse::<BrokerKey>().ok())
+                .ok_or_else(|| bad("a broker key is 64 hex characters".into()))?;
+            keys.push(key);
+        }
+    }
+    Ok(keys)
 }
 
 fn file_name(p: &Path) -> String {
@@ -227,6 +330,48 @@ pub enum LoadError {
         /// What is wrong.
         message: String,
     },
+    /// An action id is not `[a-z][a-z0-9_.]*`.
+    ActionId {
+        /// The action id.
+        action: String,
+    },
+    /// A permit names a Never action or `class:never` in its action scope.
+    PermitsNever {
+        /// The policy id.
+        id: String,
+    },
+    /// `constraints.toml` is invalid: syntax, an unknown action, or an entry
+    /// that is not exactly one non-empty `enum` or one `pattern`.
+    Constraints {
+        /// What is wrong.
+        message: String,
+    },
+    /// A constraint pattern does not compile, is too long, or exceeds the
+    /// size limits.
+    PatternInvalid {
+        /// The action.
+        action: String,
+        /// The parameter.
+        param: String,
+    },
+    /// A constraint pattern can match a control character, a bidi control or
+    /// a shell metacharacter, so it would clear arbitrary text.
+    PatternTooBroad {
+        /// The action.
+        action: String,
+        /// The parameter.
+        param: String,
+    },
+    /// `approval.toml` is invalid.
+    Approval {
+        /// What is wrong.
+        message: String,
+    },
+    /// A broker key is not a valid Ed25519 public key, or is a weak key.
+    BrokerKey {
+        /// Position in the key list.
+        index: usize,
+    },
 }
 
 impl fmt::Display for LoadError {
@@ -266,6 +411,21 @@ impl fmt::Display for LoadError {
                 )
             }
             LoadError::Autonomy { message } => write!(f, "autonomy.toml: {message}"),
+            LoadError::ActionId { action } => {
+                write!(f, "action id {action:?} is not [a-z][a-z0-9_.]*")
+            }
+            LoadError::PermitsNever { id } => {
+                write!(f, "policy {id:?} permits a Never action")
+            }
+            LoadError::Constraints { message } => write!(f, "constraints.toml: {message}"),
+            LoadError::PatternInvalid { action, param } => {
+                write!(f, "constraint {action}.{param}: pattern is invalid")
+            }
+            LoadError::PatternTooBroad { action, param } => {
+                write!(f, "constraint {action}.{param}: pattern is too broad")
+            }
+            LoadError::Approval { message } => write!(f, "approval.toml: {message}"),
+            LoadError::BrokerKey { index } => write!(f, "broker key {index} is not valid"),
         }
     }
 }

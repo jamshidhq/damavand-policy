@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 
 use crate::types::{Approver, Decision, EscalateReason};
 
-/// Capability name. Its parameters are `{"bundle": "<sha>"}`.
+/// Capability name. Its parameters are `{"bundle": "<bundle id>"}`, the
+/// content digest from [`crate::Engine::bundle_id`].
 pub const CAPABILITY: &str = "policy";
 /// Decide one request. All three outcomes are successful results.
 pub const METHOD_DECIDE: &str = "policy/decide";
@@ -33,33 +34,58 @@ pub mod codes {
     pub const GRANT_INVALID: i64 = 1005;
 }
 
-/// The `policy/decide` result for a decision:
-/// `{outcome, notify?, rule?, reason?, param?, to?, decisionId}`.
-pub fn decision_result(d: &Decision) -> Value {
-    let to = |a: &Approver| match a {
+fn approver_name(a: &Approver) -> &'static str {
+    match a {
         Approver::Child => "child",
         Approver::Main => "main",
         Approver::User => "user",
+    }
+}
+
+/// One reason as `{reason, rule?, param?}`.
+fn reason_json(r: &EscalateReason) -> Value {
+    let (name, extra) = match r {
+        EscalateReason::NoMatch => ("noMatch", None),
+        EscalateReason::PolicyAsk(rule) => ("policyAsk", Some(("rule", rule.as_str()))),
+        EscalateReason::AutonomyRequiresApproval => ("autonomyRequiresApproval", None),
+        EscalateReason::TaintedParam(p) => ("taintedParam", Some(("param", p.as_str()))),
     };
+    let mut v = json!({ "reason": name });
+    if let Some((k, val)) = extra {
+        v[k] = Value::from(val);
+    }
+    v
+}
+
+/// The `policy/decide` result for a decision:
+/// `{outcome, notify?, grantNonce?, rule?, reason?, param?, reasons?, to?,
+/// decisionId}`.
+///
+/// On Escalate, `reason` (with its `rule` or `param`) is the most severe
+/// reason and `reasons` lists all of them, most severe first. On an Allow
+/// that a grant lifted, `grantNonce` is the nonce the core must consume.
+pub fn decision_result(d: &Decision) -> Value {
     let id = &d.record().decision_id;
     match d {
-        Decision::Allow { notify, .. } => {
-            json!({"outcome": "allow", "notify": notify, "decisionId": id})
+        Decision::Allow { notify, record } => {
+            let mut v = json!({"outcome": "allow", "notify": notify, "decisionId": id});
+            if let Some(n) = &record.grant_nonce {
+                v["grantNonce"] = Value::from(n.to_string());
+            }
+            v
         }
         Decision::Deny { rule, .. } => json!({"outcome": "deny", "rule": rule, "decisionId": id}),
-        Decision::Escalate {
-            reason, to: who, ..
-        } => {
-            let mut v = json!({"outcome": "escalate", "to": to(who), "decisionId": id});
-            let (name, extra) = match reason {
-                EscalateReason::NoMatch => ("noMatch", None),
-                EscalateReason::PolicyAsk(rule) => ("policyAsk", Some(("rule", rule.as_str()))),
-                EscalateReason::AutonomyRequiresApproval => ("autonomyRequiresApproval", None),
-                EscalateReason::TaintedParam(p) => ("taintedParam", Some(("param", p.as_str()))),
-            };
-            v["reason"] = Value::from(name);
-            if let Some((k, val)) = extra {
-                v[k] = Value::from(val);
+        Decision::Escalate { reasons, to, .. } => {
+            let mut v = json!({
+                "outcome": "escalate",
+                "to": approver_name(to),
+                "decisionId": id,
+                "reasons": reasons.iter().map(reason_json).collect::<Vec<_>>(),
+            });
+            if let Some(Value::Object(first)) = reasons.first().map(reason_json) {
+                for (k, val) in first {
+                    v[k] = val;
+                }
             }
             v
         }
@@ -87,9 +113,14 @@ pub fn autonomy_caps(engine: &crate::Engine) -> Value {
     json!({"projects": table(caps.projects()), "loops": table(caps.loops())})
 }
 
-/// The `policy/bundleInfo` result: `{"bundle": sha, "schemaVersion": 1}`.
+/// The `policy/bundleInfo` result: `{"bundle": <content digest>, "label":
+/// <commit sha>, "schemaVersion": 1}`.
 pub fn bundle_info(engine: &crate::Engine) -> Value {
-    json!({"bundle": engine.bundle_id().0, "schemaVersion": SCHEMA_VERSION})
+    json!({
+        "bundle": engine.bundle_id().to_string(),
+        "label": engine.bundle_label(),
+        "schemaVersion": SCHEMA_VERSION,
+    })
 }
 
 /// Version of the Damavand Cedar schema this crate speaks.

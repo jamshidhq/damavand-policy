@@ -13,6 +13,28 @@ open questions; section 10 records where v0.1 differs from sections 0-8.
 - Autonomy L0-L3 plus Never, per loop and action class. Tainted parameters need approval unless they match a manifest enum or pattern.
 - MSRV target 1.85 (superseded: 1.89, see section 9, decision 1).
 
+### Trust boundary
+
+The engine is a pure function of the bundle and one request. It trusts the
+bundle (git, reviewed) and the **core** that builds the request. It trusts
+nothing an agent wrote.
+
+| Input | Who sets it | What the engine checks |
+|---|---|---|
+| Principal, entity graph (orchestrator `depth`, Loop and Project membership) | The core, from its own state machine. Never from agent input. | Schema validation; every `Orchestrator` has `depth` `main` or `child`; a `Worker` principal is in an orchestrator or a loop. Anything else is `Deny(damavand.topology)`. |
+| Parameter values | The agent proposes them. | Nothing; they are data. |
+| Parameter `taint` | The producer (core router, quarantine reader, tools part). | Required on the wire; no default. Anything but `clean` is tainted. |
+| Constraints that clear taint | The bundle (`constraints.toml`). | Compiled at load; a request cannot carry one (unknown field). |
+| Grants | The approval broker in the core, signing with Ed25519. | Signature by a broker key from the bundle, over every bound field; expiry against `now`. |
+| `now` | The core's clock. | Required; the engine has no clock. |
+
+Limits the engine cannot close and the core owns:
+
+- An omitted edge is invisible. A worker that sits in a loop and under an
+  orchestrator, sent without its Loop parent, gets the project cap. Only the
+  core can know the worker is in a loop.
+- Grant nonces are single-use only if the core consumes them (section 4).
+
 Below: **proposed** by this doc.
 
 Verified 2026-11-01: `cedar-policy` 4.14.0, Apache-2.0, MSRV **1.89**; last 1.85 release 4.7.1. API used: `Authorizer::is_authorized`, `diagnostics().reason()` and `.errors()`, `PolicySet::annotation()`, strict `Validator`. String matching: `like` with `*` only.
@@ -29,7 +51,7 @@ One namespace `Damavand` serves both products. Product extensions use their own 
 | Actions | Fixed verbs, each in exactly one class: `j_read`, `j_edit`, `run_command`, `git_push`, `http_request`, `k8s_apply`, `terraform_apply`, … MCP tools: `mcp_call` on a `Tool`, class from the manifest. |
 | Context | `autonomy: Long` (0-3, effective), `action_class: String`, `taint_unvalidated: Bool`, `tainted_params: Set<String>`, `budget: {tokens_left: Long, actions_left: Long}`, `run_id: String` |
 
-Bundle = git dir (`schema.cedarschema`, `global/`, `projects/<id>/`, `autonomy.toml`); id = commit sha. The loader validates strictly and refuses policies without `@id` or project policies not scoped `in Project::"<id>"`.
+Bundle = git dir (`schema.cedarschema`, `global/`, `projects/<id>/`, `autonomy.toml`, `constraints.toml`, `approval.toml`). Bundle id = SHA-256 over the canonical content (length-prefixed, domain-separated; files sorted by name, projects by id; broker keys included), computed by `Engine::load`. The commit sha is kept as a human label. The loader validates strictly and refuses policies without `@id` or project policies not scoped `in Project::"<id>"`. Action ids match `[a-z][a-z0-9_.]*`.
 
 ## 2. Precedence and "ask"
 
@@ -52,17 +74,28 @@ Tiers only pick the reported rule id: strongest tier, then lexical `@id`. Side e
 - Caps live in git (`autonomy.toml`), per (loop or project, action class).
 - The caller sends an optional override; the policy part stays stateless. Effective level = min(cap, override), so the UI can lower but never raise.
 - Autonomy only downgrades a candidate Allow: L0 allows `class:read` only, else Deny. L1 adds `class:draft`, else Deny. L2 gives `Escalate{AutonomyRequiresApproval, to: User}`. L3 gives `Allow{notify: true}`.
-- Never: a global forbid on `class:never`, plus a Rust Deny gate that no bundle can remove.
+- Never: a global forbid on `class:never` that the loader injects (`@id damavand.never`), plus a Rust Deny gate that no bundle can remove. The loader refuses a permit whose action scope names a Never action or `class:never`. Built-in Never verbs (`NEVER_ACTIONS`: apply, destroy and import for terraform and tofu) cannot leave `class:never`; any other verb is Never by class.
 
 ## 4. Taint
 
 - Policy consumes taint. It does not propagate taint.
 - The producer (core router, quarantine reader, tools part) sets taint. A parameter a model proposes after it read untrusted text is tainted.
-- Data: `Param {name, value, taint: Clean | Untrusted{sources}, constraint: Option<Enum(Vec) | Pattern(..)>}`.
+- Data: `Param {name, value, taint: Clean | Untrusted{sources}}`. `taint` is required; a request with any unknown field (such as `constraint`) is refused.
+- Constraints live in the bundle, `constraints.toml`, keyed by (action, parameter): one non-empty `enum` or one `pattern`. A parameter with no bundle constraint stays tainted.
+- Patterns are compiled at load: `regex` syntax, at most 1024 bytes, size and nest limits, compiled alone first (so `x)|(.*` fails), then anchored `\A(?:…)\z`. A pattern that can match a forbidden character is refused (`PatternTooBroad`): C0/C1 controls (newline included), DEL, bidi controls, and `` $ ` ; | & < > \ " ' ``. The check walks the parsed pattern and collects every character a literal or class can produce, so it over-approximates: `.*`, `(?s).*`, `.+`, `[\s\S]*`, `.*x` and `[^a]*` are refused; `[a-z0-9/._-]+` and `\w+` load. It does not judge breadth over safe characters: `[a-z ]+` loads and clears plain English. The bundle author owns that choice.
 - Rust checks the constraint before Cedar (`like` cannot). A match clears that parameter only.
 - A gate after Cedar: any uncleared tainted parameter turns Allow into `Escalate{TaintedParam, to: User}`. Policy content cannot change this.
-- Approval: `Grant{request_digest, approver}` on the re-sent request. The digest covers principal, action, resource and all parameters. A matching grant turns Escalate into Allow, never Deny.
 - A classifier has no input to `decide()` in v0.1, so it cannot allow.
+
+### Grant protocol
+
+1. `decide` returns `Escalate{reasons, to}`. `reasons` lists every reason, most severe first: TaintedParam > PolicyAsk > AutonomyRequiresApproval > NoMatch.
+2. The core shows the approver the request and all reasons. On approval, the **approval broker** in the core signs `grant_signing_bytes(bundle_id, request, reasons, approver, expires_at, nonce)` with its Ed25519 key. The bytes are canonical and length-prefixed (no maps, no floats): domain tag, bundle id, run id, request digest (principal, action, resource, every parameter's name, value and taint), entities digest (sorted entities, parents and attribute keys; a float attribute has no digest, so no grant), every reason with its rule id or parameter name, approver, `expires_at`, nonce.
+3. The core re-sends the request with `approval: {approver, expiresAt, nonce, signature}`.
+4. The engine recomputes the bytes from **its own** bundle id, the request and its own reasons, and lifts Escalate to `Allow{notify: true}` only when one bundle broker key verifies the signature (`verify_strict`), the approver ranks at least `to`, and `now < expiresAt`. A grant never lifts Deny. A bundle with no broker key accepts no grant.
+5. The Allow carries the nonce (`DecisionRecord::grant_nonce`, wire `grantNonce`). **The engine is stateless and cannot see a replay.** The core must consume the nonce atomically (insert-if-absent in its store) before it acts, and treat a nonce it has seen as Deny.
+
+The engine holds only public keys (`approval.toml`, in the bundle and so in the bundle id). `DecisionRequest::digest()` stays public: knowing it does not let anyone sign.
 
 ## 5. Public API sketch
 
@@ -75,11 +108,11 @@ impl Engine {
 }
 #[non_exhaustive] pub struct DecisionRequest { principal, action: ActionRef,
     resource: ResourceRef, params: Vec<Param>, autonomy_override: Option<Autonomy>,
-    budget: Budget, run_id: RunId, approval: Option<Grant> }
+    budget: Budget, run_id: RunId, now: u64, approval: Option<Grant> }
 #[non_exhaustive] pub enum Decision {
     Allow    { notify: bool, record: DecisionRecord },
     Deny     { rule: RuleId, record: DecisionRecord },
-    Escalate { reason: EscalateReason, to: Approver, record: DecisionRecord } }
+    Escalate { reasons: Vec<EscalateReason>, to: Approver, record: DecisionRecord } }
 #[non_exhaustive] pub enum EscalateReason { NoMatch, PolicyAsk(RuleId),
     AutonomyRequiresApproval, TaintedParam(String) }
 #[non_exhaustive] pub enum Approver { Child, Main, User }
@@ -93,8 +126,8 @@ impl Engine {
 ## 6. Wire (damavand-proto)
 
 - Capability `policy`, params `{"bundle": "<sha>"}`. Method names use `policy/<verb>`, in MCP style.
-- `policy/decide`: all three outcomes are successful results `{outcome, rule?, reason?, to?, decisionId}`.
-- `policy/autonomyCaps` (git caps, for the UI) and `policy/bundleInfo` (sha, schema version).
+- `policy/decide`: all three outcomes are successful results `{outcome, notify?, grantNonce?, rule?, reason?, param?, reasons?, to?, decisionId}`. On Escalate, `reason` is the most severe reason and `reasons` lists all.
+- `policy/autonomyCaps` (git caps, for the UI) and `policy/bundleInfo` (bundle id, label, schema version).
 - An enforcer treats any error or timeout as Deny.
 
 | Code | Name |
@@ -111,12 +144,13 @@ impl Engine {
 - Conformance: YAML cases (bundle + request → outcome + rule id), feature `conformance`, runnable over the wire.
 - Properties (proptest): matching hard forbid → never Allow; uncleared taint → never Allow, any level, any bundle; `class:never` → always Deny; lower autonomy → never a higher outcome; empty bundle → only Escalate; policy order does not change results; `decide` never panics.
 - Golden fixtures: `jamshid-default` and `devops-l0` bundles with golden decisions; invalid bundles with exact `LoadError`s.
-- Mutation targets (`cargo-mutants`): meet, tier order, constraint matching, autonomy min, error-to-Deny, grant digest.
+- Properties also cover: a missing `taint` never parses; forged, expired or tampered grants never lift and a valid one exposes its nonce on replay; a caller-chosen `depth`; an omitted Loop parent of a loop-only worker; a loaded pattern never clears a forbidden character.
+- Mutation targets (`cargo-mutants`): meet, tier order, constraint matching, autonomy min, error-to-Deny, grant signing bytes and verification, bundle digest, topology.
 
 ## 8. Dependencies and scope
 
 - Depends on: `damavand-proto` (not in v0.1, see section 10), `cedar-policy` (default features, no `experimental`), `serde`, `serde_json`, `regex`.
-- Manifest and audit come later. v0.1 keeps local types: `ParamConstraint`, the action-to-class map, `DecisionRecord` (UUIDv7, sha, rule ids, outcome).
+- Manifest and audit come later. v0.1 keeps local types: bundle constraints (`constraints.toml`), the action-to-class map, `DecisionRecord` (UUIDv7, bundle id, rule ids, grant nonce).
 - v0.1: schema v1, loader, `decide`, the three gates, grants, `policy/decide|autonomyCaps|bundleInfo`, conformance suite. Two consumers: the jamshid test harness and the DevOps L0 loop.
 - Later: hot reload, `policy/explain`, signed bundles, budget accounting, a deny-only classifier hint, manifest and audit types.
 
@@ -125,7 +159,8 @@ impl Engine {
 The owner accepted every recommendation of the former open questions.
 
 1. **MSRV.** The family MSRV is 1.89. This crate uses the latest
-   `cedar-policy` 4.x, pinned exactly (4.14.0 at first release).
+   `cedar-policy` 4.x at `~4.14.0` (patch updates only); `Cargo.lock` is
+   committed.
 2. **Who approves.** L2 actions and tainted parameters escalate straight to
    the user. Only NoMatch with clean parameters goes up the chain
    worker → child → main.
@@ -154,13 +189,29 @@ ways:
 - **"Empty bundle gives only Escalate"** (section 7) holds only where the
   autonomy cap allows the class; the tested property is "never Allow".
 - **Never** is a Rust gate on the class `class:never` and on a built-in list
-  (`NEVER_ACTIONS`). The loader refuses a bundle that puts a built-in Never
-  action in another class, so a bundle cannot reclassify it away.
-- **Grants** lift an escalation only when the grant's approver ranks at least
-  as high as the escalation's `to` (child < main < user).
+  (`NEVER_ACTIONS`), plus a loader-injected global forbid. The loader refuses
+  a bundle that puts a built-in Never action in another class, and a permit
+  that names a Never action or `class:never`. An unscoped permit
+  (`action` alone) still loads; the injected forbid beats it.
+- **Grants** are Ed25519-signed by the core's approval broker (section 4,
+  grant protocol). Section 4 first said `Grant{request_digest, approver}`;
+  anyone who could hash a request could mint that, so v0.1 signs. A grant
+  lifts an escalation only when its approver ranks at least as high as the
+  escalation's `to` (child < main < user).
+- **Tied escalations** keep every reason, most severe first, and go to the
+  highest approver. Section 5 had one `reason`; one reason hid taint behind
+  an autonomy escalation.
+- **Constraints** live in the bundle, not the request (section 4 put them on
+  `Param`). A caller-supplied constraint let the caller clear its own taint.
+- **Bundle id** is a content digest, not the commit sha (section 1); the sha
+  is the label.
+- **Topology.** The engine refuses an orchestrator `depth` other than `main`
+  or `child`, and a worker principal in neither an orchestrator nor a loop
+  (`damavand.topology`). Before, an unknown depth escalated to the user and a
+  detached worker escalated by NoMatch.
 - **NoMatch target.** A worker escalates by the `depth` of its orchestrator
   parent (`child` → Child, `main` → Main); a child orchestrator to Main;
-  anything else, or unknown structure, to the user.
+  anything else to the user.
 - **Caps.** The cap is the lowest entry over every project and loop the
   principal is in; no entry is L0. `autonomy.toml` has no `never` key.
 - **Policy ids.** `@id` is required, unique across the bundle, and the
@@ -168,6 +219,10 @@ ways:
   scoped with `resource in`, `resource ==` or `resource is … in`
   `Project::"<id>"`.
 - **Context.** `tainted_params` lists only uncleared tainted parameters.
+- **Dependencies.** `ed25519-dalek` 2.2.0 (BSD-3-Clause, MSRV 1.81), not
+  3.0.0: 3.0.0 pulls `sha2`/`digest` 0.11 next to cedar's build-time
+  `digest` 0.10, a duplicate `cargo deny` refuses. `regex-syntax` (already in
+  the tree through `regex`) parses patterns for the breadth check.
 - **MCP tools.** `mcp_call` with a class from the manifest is not in v0.1; it
   waits for the manifest crate.
 - **damavand-proto.** Not a dependency in v0.1 (it is unpublished). The wire

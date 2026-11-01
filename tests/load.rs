@@ -327,12 +327,232 @@ fn autonomy_valid() {
 
 #[test]
 fn bundle_accessors() {
-    let b = Bundle::new(BundleId("abc".into()), SCHEMA);
-    assert_eq!(b.id(), &BundleId("abc".into()));
-    assert_eq!(
-        Engine::load(&b).unwrap().bundle_id(),
-        &BundleId("abc".into())
+    let b = Bundle::new("abc", SCHEMA);
+    assert_eq!(b.label(), "abc");
+    assert_eq!(Engine::load(&b).unwrap().bundle_label(), "abc");
+}
+
+fn digest(b: &Bundle) -> BundleId {
+    *Engine::load(b).unwrap().bundle_id()
+}
+
+#[test]
+fn bundle_id_is_a_content_digest() {
+    let base = Bundle::new("a", SCHEMA);
+    let d = digest(&base);
+    // The label is not content.
+    assert_eq!(digest(&Bundle::new("b", SCHEMA)), d);
+    // Every part of the content is.
+    let variants = [
+        Bundle::new("a", format!("{SCHEMA}\n")),
+        base.clone().with_global("g.cedar", READ),
+        base.clone().with_global("h.cedar", ""),
+        base.clone().with_project("jamshid", "p.cedar", ""),
+        base.clone().with_project("other", "p.cedar", ""),
+        base.clone().with_autonomy("[loop.x]\nread = 0\n"),
+        base.clone()
+            .with_constraints("[j_edit.p]\nenum = [\"a\"]\n"),
+        base.clone().with_broker_key(common::broker_key()),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(d);
+    for v in &variants {
+        assert!(seen.insert(digest(v)), "{v:?}");
+    }
+    // File order does not matter; the name does.
+    let first = base
+        .clone()
+        .with_global("a.cedar", READ)
+        .with_global("b.cedar", "");
+    let second = base
+        .clone()
+        .with_global("b.cedar", "")
+        .with_global("a.cedar", READ);
+    assert_eq!(digest(&first), digest(&second));
+    // Fields are length-prefixed: moving text between name and body changes it.
+    let one = base.clone().with_global("a", "//b//");
+    let two = base.clone().with_global("a//b", "//");
+    assert_ne!(digest(&one), digest(&two));
+}
+
+#[test]
+fn action_ids_are_lower_case_identifiers() {
+    for bad in [
+        "\"Draft PR\"",
+        "\"draftPR\"",
+        "\"9pr\"",
+        "\"pr-x\"",
+        "\"_pr\"",
+    ] {
+        let schema = SCHEMA.replace("action draft_pr in", &format!("action {bad} in"));
+        assert_ne!(schema, SCHEMA);
+        assert_eq!(
+            err(Bundle::new(id(), schema)),
+            LoadError::ActionId {
+                action: bad.trim_matches('"').into()
+            },
+            "{bad}"
+        );
+    }
+    let ok = SCHEMA.replace("action draft_pr in", "action \"draft.pr_2\" in");
+    Engine::load(&Bundle::new(id(), ok)).unwrap();
+}
+
+#[test]
+fn permits_naming_never_are_refused() {
+    let never = common::NEVER_ACTION;
+    for scope in [
+        format!(r#"action == Damavand::Action::"{never}""#),
+        r#"action in Damavand::Action::"class:never""#.to_string(),
+        format!(r#"action in [Damavand::Action::"j_read", Damavand::Action::"{never}"]"#),
+        r#"action in [Damavand::Action::"class:never"]"#.to_string(),
+    ] {
+        let b = Bundle::new(id(), SCHEMA).with_global(
+            "g.cedar",
+            format!(r#"@id("p") permit (principal, {scope}, resource);"#),
+        );
+        assert_eq!(
+            err(b),
+            LoadError::PermitsNever { id: "p".into() },
+            "{scope}"
+        );
+    }
+    // A bundle-defined Never action is caught by class, not by name.
+    let schema = SCHEMA.replace(
+        "action use_secret in [\"class:secret.use\"]",
+        "action wipe_db in [\"class:never\"] appliesTo {\n    principal: [Worker], resource: [Repo], context: Ctx };\n  action use_secret in [\"class:secret.use\"]",
     );
+    let b = Bundle::new(id(), schema).with_global(
+        "g.cedar",
+        r#"@id("w") permit (principal, action == Damavand::Action::"wipe_db", resource);"#,
+    );
+    assert_eq!(err(b), LoadError::PermitsNever { id: "w".into() });
+    // Forbids may name it, and an unscoped permit still loads.
+    Engine::load(&Bundle::new(id(), SCHEMA).with_global(
+        "g.cedar",
+        format!(
+            r#"@id("f") forbid (principal, action == Damavand::Action::"{never}", resource);
+               @id("a") permit (principal, action, resource);"#
+        ),
+    ))
+    .unwrap();
+}
+
+#[test]
+fn builtin_never_actions_cannot_be_reclassified() {
+    for verb in damavand_policy::NEVER_ACTIONS {
+        let schema = if *verb == common::NEVER_ACTION {
+            SCHEMA.replace(
+                &format!("action {verb} in [\"class:never\"]"),
+                &format!("action {verb} in [\"class:write.remote\"]"),
+            )
+        } else {
+            SCHEMA.replace(
+                "action use_secret in",
+                &format!(
+                    "action {verb} in [\"class:write.remote\"] appliesTo {{\n    principal: [Worker], resource: [Repo], context: Ctx }};\n  action use_secret in"
+                ),
+            )
+        };
+        assert_ne!(schema, SCHEMA);
+        assert_eq!(
+            err(Bundle::new(id(), schema)),
+            LoadError::NeverReclassified {
+                action: verb.to_string()
+            }
+        );
+    }
+}
+
+fn constraints_err(toml: &str) -> LoadError {
+    err(Bundle::new(id(), SCHEMA).with_constraints(toml))
+}
+
+#[test]
+fn constraints_file_is_strict() {
+    for bad in [
+        "not toml [",
+        "[nope.p]\nenum = [\"a\"]\n",
+        "j_edit = 1\n",
+        "[j_edit]\np = 1\n",
+        "[j_edit.p]\n",
+        "[j_edit.p]\nenum = []\n",
+        "[j_edit.p]\nenum = [1]\n",
+        "[j_edit.p]\nenum = \"a\"\n",
+        "[j_edit.p]\npattern = 1\n",
+        "[j_edit.p]\nenum = [\"a\"]\npattern = \"a\"\n",
+        "[j_edit.p]\nregex = \"a\"\n",
+    ] {
+        assert!(
+            matches!(constraints_err(bad), LoadError::Constraints { .. }),
+            "{bad}"
+        );
+    }
+    Engine::load(&Bundle::new(id(), SCHEMA).with_constraints(
+        "[j_edit.mode]\nenum = [\"append\"]\n[j_edit.path]\npattern = \"[a-z/]+\"\n",
+    ))
+    .unwrap();
+}
+
+#[test]
+fn constraint_patterns_are_checked_at_load() {
+    let pat = |p: &str| constraints_err(&format!("[j_edit.p]\npattern = '{p}'\n"));
+    let at = || ("j_edit".to_string(), "p".to_string());
+    for p in ["x)|(.*", "(", "a{1000}{1000}"] {
+        let (action, param) = at();
+        assert_eq!(pat(p), LoadError::PatternInvalid { action, param }, "{p}");
+    }
+    for p in [".*", "(?s).*", ".+", r"[\s\S]*", ".{0,999}", ".*x"] {
+        let (action, param) = at();
+        assert_eq!(pat(p), LoadError::PatternTooBroad { action, param }, "{p}");
+    }
+}
+
+#[test]
+fn approval_file_and_broker_keys() {
+    let dir = std::env::temp_dir().join(format!("damavand-approval-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("schema.cedarschema"), SCHEMA).unwrap();
+    let with = |text: &str| {
+        std::fs::write(dir.join("approval.toml"), text).unwrap();
+        Bundle::from_dir(&dir, "x")
+    };
+    let key = common::broker_key().to_string();
+    let b = with(&format!("broker_keys = [\"{key}\"]\n")).unwrap();
+    Engine::load(&b).unwrap();
+    for bad in [
+        "broker_keys = \"x\"\n",
+        "broker_keys = [\"zz\"]\n",
+        "broker_keys = [1]\n",
+        "keys = []\n",
+        "[",
+    ] {
+        assert!(
+            matches!(with(bad), Err(LoadError::Approval { .. })),
+            "{bad}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    // A key that is not a curve point, and a weak (small-order) key.
+    let not_point = (2u8..=255)
+        .map(|b| {
+            let mut k = [0u8; 32];
+            k[0] = b;
+            k
+        })
+        .find(|k| ed25519_dalek::VerifyingKey::from_bytes(k).is_err())
+        .expect("some y has no curve point");
+    let identity = {
+        let mut k = [0u8; 32];
+        k[0] = 1;
+        k
+    };
+    for (i, k) in [not_point, identity].into_iter().enumerate() {
+        let b = Bundle::new(id(), SCHEMA)
+            .with_broker_key(common::broker_key())
+            .with_broker_key(damavand_policy::BrokerKey(k));
+        assert_eq!(err(b), LoadError::BrokerKey { index: 1 }, "case {i}");
+    }
 }
 
 #[test]
@@ -365,4 +585,24 @@ fn extension_namespace_actions_are_left_alone() {
     );
     let e = Engine::load(&Bundle::new(id(), schema)).unwrap();
     assert_eq!(e.action_class("ping"), None);
+}
+
+#[test]
+fn never_forbid_is_injected_only_when_the_schema_has_class_never() {
+    let schema: String = SCHEMA
+        .lines()
+        .filter(|l| !l.contains(common::NEVER_ACTION))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace(", \"class:never\";", ";");
+    let schema = schema.replace(
+        "  action use_secret in [\"class:secret.use\"] appliesTo {\n    principal: [Worker, Orchestrator, User], resource: [SecretRef], context: Ctx };\n    principal: [Worker, Orchestrator, User], resource: [Repo], context: Ctx };",
+        "  action use_secret in [\"class:secret.use\"] appliesTo {\n    principal: [Worker, Orchestrator, User], resource: [SecretRef], context: Ctx };",
+    );
+    assert!(!schema.contains("class:never"), "{schema}");
+    let e = Engine::load(&Bundle::new(id(), schema).with_global("g.cedar", READ)).unwrap();
+    assert_eq!(
+        e.action_class("j_read"),
+        Some(damavand_policy::ActionClass::Read)
+    );
 }

@@ -1,0 +1,11 @@
+# Constraints that clear a tainted parameter, per (action, parameter).
+# Requests cannot carry constraints; only the bundle sets them.
+
+[j_edit.mode]
+enum = ["append", "replace"]
+
+[j_edit.path]
+pattern = "[a-z0-9/._-]+"
+
+[j_edit.kind]
+pattern = "a|b"

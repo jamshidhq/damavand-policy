@@ -1,0 +1,3 @@
+# Ed25519 public keys of the approval broker. The test seed lives in
+# tests/common (broker_seed); production bundles list the core's broker.
+broker_keys = ["1dceb75e815d0b4e73ce1122d57072c2103efebf26e196168835d0f04b53a13c"]

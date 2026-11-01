@@ -12,11 +12,14 @@
 //!    marked `@outcome("ask")` is Escalate (PolicyAsk); any evaluation error
 //!    is Deny.
 //! 2. Autonomy: effective level = min(git cap, caller override).
-//! 3. Taint: an untrusted parameter that no manifest constraint clears is
+//! 3. Taint: an untrusted parameter that no bundle constraint clears is
 //!    Escalate to the user.
 //!
-//! Never actions are denied before Cedar runs. An approval ([`Grant`]) bound
-//! to the request digest lifts Escalate to Allow; it never lifts Deny.
+//! Never actions are denied before Cedar runs. An approval ([`Grant`]),
+//! signed by the core's approval broker over the bundle, run, request,
+//! entities and escalation reasons, lifts Escalate to Allow; it never lifts
+//! Deny. The engine is stateless: the core consumes the grant nonce that the
+//! Allow carries.
 //!
 //! No Cedar type is in the public API.
 #![forbid(unsafe_code)]
@@ -24,6 +27,7 @@
 mod bundle;
 mod engine;
 mod gates;
+mod grant;
 mod types;
 pub mod wire;
 
@@ -32,8 +36,9 @@ pub mod conformance;
 
 pub use bundle::{Bundle, LoadError};
 pub use engine::{AutonomyCaps, Engine, NEVER_ACTIONS};
+pub use grant::grant_signing_bytes;
 pub use types::{
-    ActionClass, Approver, Autonomy, Budget, BundleId, Decision, DecisionRecord, DecisionRequest,
-    Entity, EntityRef, EscalateReason, Grant, Outcome, Param, ParamConstraint, RequestDigest,
-    RuleId, Taint,
+    ActionClass, Approver, Autonomy, BrokerKey, Budget, BundleId, Decision, DecisionRecord,
+    DecisionRequest, Entity, EntityRef, EscalateReason, Grant, GrantNonce, GrantSignature, Outcome,
+    Param, RequestDigest, RuleId, Taint,
 };

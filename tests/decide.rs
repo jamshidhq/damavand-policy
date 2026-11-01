@@ -4,8 +4,8 @@ mod common;
 
 use common::{NEVER_ACTION, SCHEMA, id, lib, load, r, repo, request, w1};
 use damavand_policy::{
-    Approver, Autonomy, Budget, Bundle, Decision, DecisionRequest, Engine, EscalateReason, Grant,
-    Outcome, Param, RuleId,
+    Approver, Autonomy, Budget, Bundle, Decision, DecisionRequest, Engine, EscalateReason, Outcome,
+    Param, RuleId,
 };
 
 const PERMIT_ALL: &str = r#"@id("all") permit (principal, action, resource);"#;
@@ -38,7 +38,7 @@ fn missing_entity_attribute_error_denies() {
         "{PERMIT_ALL}\n@id(\"depth\") forbid (principal is Damavand::Orchestrator, action, resource) \
          when {{ principal.depth == \"x\" }};"
     ));
-    let req = DecisionRequest::new(r("Orchestrator", "ghost"), "j_read", lib());
+    let req = DecisionRequest::new(r("Orchestrator", "ghost"), "j_read", lib(), common::NOW);
     assert_eq!(deny_rule(&e.decide(&req)), RuleId::EVAL_ERROR);
 }
 
@@ -141,10 +141,7 @@ fn empty_bundle_never_allows_beyond_read_class_gates() {
         assert!(
             matches!(
                 d,
-                Decision::Escalate {
-                    reason: EscalateReason::NoMatch,
-                    ..
-                }
+                Decision::Escalate { ref reasons, .. } if reasons == &[EscalateReason::NoMatch]
             ),
             "{action}: {d:?}"
         );
@@ -199,12 +196,11 @@ fn ask_reports_the_lowest_ask_rule() {
            @id("a.ask") @outcome("ask") forbid (principal, action, resource);"#,
     );
     match e.decide(&request(w1(), "j_read", lib())) {
-        Decision::Escalate {
-            reason: EscalateReason::PolicyAsk(rule),
-            to,
-            ..
-        } => {
-            assert_eq!(rule.as_str(), "a.ask");
+        Decision::Escalate { reasons, to, .. } => {
+            assert_eq!(
+                reasons,
+                vec![EscalateReason::PolicyAsk(RuleId("a.ask".into()))]
+            );
             assert_eq!(to, Approver::User);
         }
         other => panic!("{other:?}"),
@@ -217,7 +213,8 @@ fn record_carries_bundle_digest_and_uuid_v7() {
     let req = request(w1(), "j_read", lib());
     let d = e.decide(&req);
     let rec = d.record();
-    assert_eq!(rec.bundle_id, id());
+    assert_eq!(&rec.bundle_id, e.bundle_id());
+    assert_eq!(rec.grant_nonce, None);
     assert_eq!(rec.request_digest, req.digest());
     assert_eq!(rec.rule_ids, vec![RuleId("all".into())]);
     assert!(!rec.approved);
@@ -231,41 +228,41 @@ fn record_carries_bundle_digest_and_uuid_v7() {
 fn granted_record_is_marked() {
     let e = load(PERMIT_ALL);
     let req = request(w1(), "j_edit", lib()).autonomy_override(Autonomy::L2ActWithApproval);
-    let granted = req
-        .clone()
-        .approval(Grant::new(req.digest(), Approver::User));
+    let g = common::grant(&e, &req, Approver::User);
+    let granted = req.clone().approval(g.clone());
     let d = e.decide(&granted);
     assert!(matches!(d, Decision::Allow { notify: true, .. }), "{d:?}");
     assert!(d.record().approved);
+    assert_eq!(d.record().grant_nonce, Some(g.nonce));
 }
 
 #[test]
 fn digest_covers_every_bound_field() {
-    let base = DecisionRequest::new(w1(), "j_edit", lib())
+    let base = DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
         .param(Param::clean("a", "1"))
         .param(Param::clean("b", "2"));
     let d0 = base.digest();
     let variants = [
-        DecisionRequest::new(r("Worker", "w2"), "j_edit", lib())
+        DecisionRequest::new(r("Worker", "w2"), "j_edit", lib(), common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(r("User", "w1"), "j_edit", lib())
+        DecisionRequest::new(r("User", "w1"), "j_edit", lib(), common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_read", lib())
+        DecisionRequest::new(w1(), "j_read", lib(), common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", repo())
+        DecisionRequest::new(w1(), "j_edit", repo(), common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", lib())
+        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
             .param(Param::clean("x", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", lib())
+        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
             .param(Param::clean("a", "9"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", lib()).param(Param::clean("a", "1")),
-        DecisionRequest::new(w1(), "j_edit", lib())
+        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW).param(Param::clean("a", "1")),
+        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
             .param(Param::clean("a", "12"))
             .param(Param::clean("b", "")),
     ];
@@ -295,9 +292,9 @@ fn digest_covers_every_bound_field() {
 #[test]
 fn unknown_entity_type_is_request_invalid() {
     let e = load(PERMIT_ALL);
-    let req = DecisionRequest::new(r("Martian", "x"), "j_read", lib());
+    let req = DecisionRequest::new(r("Martian", "x"), "j_read", lib(), common::NOW);
     assert_eq!(deny_rule(&e.decide(&req)), RuleId::REQUEST_INVALID);
-    let req = DecisionRequest::new(w1(), "j_read", r("Bad Type", "x"));
+    let req = DecisionRequest::new(w1(), "j_read", r("Bad Type", "x"), common::NOW);
     assert_eq!(deny_rule(&e.decide(&req)), RuleId::REQUEST_INVALID);
 }
 
@@ -323,31 +320,45 @@ fn context_carries_taint_and_class() {
         .param(Param::untrusted("p", "v", vec!["web".into()]));
     assert_eq!(deny_rule(&e.decide(&req)), "t");
     // A cleared parameter is not reported as tainted.
+    let constrained = Engine::load(
+        &common::bundle(
+            r#"@id("all") permit (principal, action, resource);
+               @id("t") forbid (principal, action, resource) when { context.taint_unvalidated };"#,
+        )
+        .with_constraints("[j_edit.p]\nenum = [\"v\"]\n"),
+    )
+    .unwrap();
     let cleared = request(w1(), "j_edit", lib())
         .autonomy_override(Autonomy::L2ActWithApproval)
-        .run_id("run-1")
-        .param(
-            Param::untrusted("p", "v", vec![])
-                .with_constraint(damavand_policy::ParamConstraint::Enum(vec!["v".into()])),
-        );
-    assert_eq!(e.decide(&cleared).outcome(), Outcome::Escalate);
+        .param(Param::untrusted("p", "v", vec![]));
+    assert_eq!(constrained.decide(&cleared).outcome(), Outcome::Escalate);
+    // The same constraint does not clear another action's parameter.
+    let other = request(w1(), "j_read", lib()).param(Param::untrusted("p", "v", vec![]));
+    assert_eq!(deny_rule(&constrained.decide(&other)), "t");
 }
 
 #[test]
-fn worker_without_orchestrator_escalates_to_user() {
+fn worker_without_orchestrator_or_loop_is_a_topology_deny() {
     let e = load(
         r#"@id("none") forbid (principal, action == Damavand::Action::"git_push", resource);"#,
     );
-    let req = DecisionRequest::new(r("Worker", "lone"), "j_read", lib())
+    let req = DecisionRequest::new(r("Worker", "lone"), "j_read", lib(), common::NOW)
         .entity(damavand_policy::Entity::new(r("Worker", "lone")));
+    assert_eq!(deny_rule(&e.decide(&req)), RuleId::TOPOLOGY);
+    // Not in the entity list at all: no ancestors either.
+    let ghost = DecisionRequest::new(r("Worker", "ghost"), "j_read", lib(), common::NOW);
+    assert_eq!(deny_rule(&e.decide(&ghost)), RuleId::TOPOLOGY);
+    // In a loop only: placed.
+    let looped = DecisionRequest::new(r("Worker", "l"), "j_read", lib(), common::NOW)
+        .entity(damavand_policy::Entity::new(r("Worker", "l")).parent(r("Loop", "nightly")));
     assert!(matches!(
-        e.decide(&req),
+        e.decide(&looped),
         Decision::Escalate {
             to: Approver::User,
             ..
         }
     ));
-    let user = DecisionRequest::new(r("User", "max"), "j_read", lib());
+    let user = DecisionRequest::new(r("User", "max"), "j_read", lib(), common::NOW);
     assert!(matches!(
         e.decide(&user),
         Decision::Escalate {
@@ -416,40 +427,47 @@ fn wire_codes_are_in_the_policy_block() {
 
 #[test]
 fn request_round_trips_through_json() {
-    let req = request(w1(), "j_edit", lib())
+    let e = load(PERMIT_ALL);
+    let base = request(w1(), "j_edit", lib())
         .param(Param::untrusted("p", "v", vec!["web".into()]))
-        .autonomy_override(Autonomy::L2ActWithApproval)
-        .approval(Grant::new(
-            DecisionRequest::new(w1(), "x", lib()).digest(),
-            Approver::Main,
-        ));
+        .autonomy_override(Autonomy::L2ActWithApproval);
+    let req = base
+        .clone()
+        .approval(common::grant(&e, &base, Approver::Main));
     let json = serde_json::to_value(&req).unwrap();
     assert_eq!(json["autonomyOverride"], 2);
+    assert_eq!(json["now"], common::NOW);
+    assert_eq!(json["approval"]["nonce"].as_str().unwrap().len(), 32);
+    assert_eq!(json["approval"]["signature"].as_str().unwrap().len(), 128);
     let back: DecisionRequest = serde_json::from_value(json).unwrap();
     assert_eq!(back, req);
-    assert!(
-        serde_json::from_value::<DecisionRequest>(serde_json::json!({
-            "principal": {"type": "Worker", "id": "w"}, "action": "a",
-            "resource": {"type": "Repo", "id": "r"}, "autonomyOverride": 4
-        }))
-        .is_err()
-    );
+    let minimal = serde_json::json!({
+        "principal": {"type": "Worker", "id": "w"}, "action": "a",
+        "resource": {"type": "Repo", "id": "r"}, "now": 1
+    });
+    assert!(serde_json::from_value::<DecisionRequest>(minimal.clone()).is_ok());
+    let with = |k: &str, v: serde_json::Value| {
+        let mut m = minimal.clone();
+        m[k] = v;
+        serde_json::from_value::<DecisionRequest>(m)
+    };
+    assert!(with("autonomyOverride", serde_json::json!(4)).is_err());
+    assert!(with("unknownField", serde_json::json!(1)).is_err());
+    let mut no_now = minimal.clone();
+    no_now.as_object_mut().unwrap().remove("now");
+    assert!(serde_json::from_value::<DecisionRequest>(no_now).is_err());
 }
 
 #[test]
 fn worker_escalation_follows_its_own_orchestrator() {
     let e = load("");
     let to = |entities: Vec<damavand_policy::Entity>| {
-        let mut req = DecisionRequest::new(w1(), "j_read", lib());
+        let mut req = DecisionRequest::new(w1(), "j_read", lib(), common::NOW);
         for ent in entities {
             req = req.entity(ent);
         }
         match e.decide(&req) {
-            Decision::Escalate {
-                reason: EscalateReason::NoMatch,
-                to,
-                ..
-            } => to,
+            Decision::Escalate { reasons, to, .. } if reasons == [EscalateReason::NoMatch] => to,
             other => panic!("{other:?}"),
         }
     };
@@ -474,15 +492,21 @@ fn worker_escalation_follows_its_own_orchestrator() {
         ]),
         Approver::Child
     );
-    // Orchestrator of unknown depth: the user.
-    assert_eq!(
-        to(vec![
-            damavand_policy::Entity::new(r("Orchestrator", "odd"))
-                .attr("depth", serde_json::json!("odd")),
-            damavand_policy::Entity::new(w1()).parent(r("Orchestrator", "odd")),
-        ]),
-        Approver::User
-    );
+    // An orchestrator of unknown depth is refused, even off the path.
+    for (path, extra) in [("odd", "main"), ("main", "odd")] {
+        let mut req = DecisionRequest::new(w1(), "j_read", lib(), common::NOW)
+            .entity(orch("main", "main"))
+            .entity(damavand_policy::Entity::new(w1()).parent(r("Orchestrator", path)));
+        req = req.entity(orch(&format!("x{extra}"), extra));
+        if path == "odd" {
+            req = req.entity(orch("odd", "odd"));
+        }
+        assert_eq!(
+            deny_rule(&e.decide(&req)),
+            RuleId::TOPOLOGY,
+            "{path}/{extra}"
+        );
+    }
 }
 
 #[test]
@@ -497,7 +521,14 @@ fn accessors_and_display() {
         Some(damavand_policy::ActionClass::WriteRemote)
     );
     assert_eq!(e.action_class("class:read"), None);
-    assert_eq!(id().to_string(), id().0);
+    assert_eq!(e.bundle_id().to_string().len(), 64);
+    assert_eq!(
+        e.bundle_id()
+            .to_string()
+            .parse::<damavand_policy::BundleId>(),
+        Ok(*e.bundle_id())
+    );
+    assert_eq!(e.bundle_label(), id());
     assert_eq!(RuleId("x.y".into()).to_string(), "x.y");
     let allow = e.decide(&request(w1(), "j_read", lib()));
     assert!(allow.is_allow());
@@ -507,9 +538,7 @@ fn accessors_and_display() {
 #[test]
 fn wire_caps_and_bundle_info() {
     let dir = common::bundles_dir().join("jamshid-default");
-    let e =
-        Engine::load(&Bundle::from_dir(&dir, damavand_policy::BundleId("abc123".into())).unwrap())
-            .unwrap();
+    let e = Engine::load(&Bundle::from_dir(&dir, "abc123").unwrap()).unwrap();
     let caps = damavand_policy::wire::autonomy_caps(&e);
     assert_eq!(caps["projects"]["jamshid"]["write.remote"], 2);
     assert_eq!(caps["projects"]["jamshid"]["read"], 3);
@@ -529,6 +558,6 @@ fn wire_caps_and_bundle_info() {
     let info = damavand_policy::wire::bundle_info(&e);
     assert_eq!(
         info,
-        serde_json::json!({"bundle": "abc123", "schemaVersion": 1})
+        serde_json::json!({"bundle": e.bundle_id().to_string(), "label": "abc123", "schemaVersion": 1})
     );
 }
