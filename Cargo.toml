@@ -2,7 +2,7 @@
 name = "damavand-policy"
 # 0.0.0 on purpose: rust-release.yaml bumps max(latest tag, this value) by the
 # PR label, so the first `minor` release becomes 0.1.0.
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Deterministic policy gateway (Cedar) for damavand agent-safety crates"
