@@ -34,7 +34,7 @@ pub mod wire;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 
-pub use bundle::{Bundle, LoadError};
+pub use bundle::{Bundle, DEFAULT_MAX_GRANT_TTL, LoadError};
 pub use engine::{AutonomyCaps, Engine, NEVER_ACTIONS};
 pub use grant::grant_signing_bytes;
 pub use types::{

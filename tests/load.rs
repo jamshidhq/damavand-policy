@@ -556,6 +556,42 @@ fn approval_file_and_broker_keys() {
 }
 
 #[test]
+fn approval_file_sets_the_max_grant_ttl() {
+    let dir = std::env::temp_dir().join(format!("damavand-ttl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("schema.cedarschema"), SCHEMA).unwrap();
+    let key = common::broker_key().to_string();
+    let with = |text: &str| {
+        std::fs::write(dir.join("approval.toml"), text).unwrap();
+        Bundle::from_dir(&dir, "x")
+    };
+    let short = with(&format!("broker_keys = [\"{key}\"]\nmax_grant_ttl = 30\n")).unwrap();
+    let default = with(&format!("broker_keys = [\"{key}\"]\n")).unwrap();
+    let explicit = with(&format!(
+        "broker_keys = [\"{key}\"]\nmax_grant_ttl = 3600\n"
+    ))
+    .unwrap();
+    for bad in [
+        "max_grant_ttl = 0\n",
+        "max_grant_ttl = -1\n",
+        "max_grant_ttl = \"1h\"\n",
+    ] {
+        assert!(
+            matches!(with(bad), Err(LoadError::Approval { .. })),
+            "{bad}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    let ids: Vec<BundleId> = [&short, &default, &explicit]
+        .iter()
+        .map(|b| *Engine::load(b).unwrap().bundle_id())
+        .collect();
+    // The TTL is bundle content, so it is in the bundle id.
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(ids[1], ids[2]);
+}
+
+#[test]
 fn load_error_display_names_the_problem() {
     let e = LoadError::ProjectScope {
         project: "jamshid".into(),

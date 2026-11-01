@@ -112,23 +112,28 @@ pub(crate) type Constraints = HashMap<(String, String), Constraint>;
 pub(crate) enum PatternError {
     Invalid,
     TooBroad,
+    MatchesEmpty,
 }
 
-/// Characters a narrow value never needs and an injection payload does:
-/// C0 and C1 controls (newline included), DEL, bidi controls, and the shell
-/// and quoting metacharacters `` $ ` ; | & < > \ " ' ``.
+/// Unicode general categories a narrow value never needs and an injection
+/// payload does: controls (`Cc`: C0, C1 and DEL, newline included), format
+/// characters (`Cf`: bidi controls, zero-width joiners and spaces, U+061C,
+/// U+FEFF, tag characters), and line and paragraph separators (`Zl`, `Zp`).
+const FORBIDDEN_CATEGORIES: &str = r"[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]";
+
+/// Every character in [`FORBIDDEN_CATEGORIES`] plus the shell and quoting
+/// metacharacters `` $ ` ; | & < > \ " ' ``. Built from the Unicode tables
+/// of `regex-syntax`, not a hand list.
 fn forbidden_unicode() -> ClassUnicode {
-    let mut ranges = vec![
-        ClassUnicodeRange::new('\u{0}', '\u{1f}'),
-        ClassUnicodeRange::new('\u{7f}', '\u{9f}'),
-        ClassUnicodeRange::new('\u{200e}', '\u{200f}'),
-        ClassUnicodeRange::new('\u{202a}', '\u{202e}'),
-        ClassUnicodeRange::new('\u{2066}', '\u{2069}'),
-    ];
-    for c in FORBIDDEN_ASCII.chars() {
-        ranges.push(ClassUnicodeRange::new(c, c));
-    }
-    ClassUnicode::new(ranges)
+    let hir = regex_syntax::parse(FORBIDDEN_CATEGORIES).expect("category class parses");
+    let HirKind::Class(Class::Unicode(mut class)) = hir.into_kind() else {
+        unreachable!("a bracket class of properties is a Unicode class")
+    };
+    let ascii = FORBIDDEN_ASCII
+        .chars()
+        .map(|c| ClassUnicodeRange::new(c, c));
+    class.union(&ClassUnicode::new(ascii));
+    class
 }
 
 const FORBIDDEN_ASCII: &str = "$`;|&<>\\\"'";
@@ -197,7 +202,13 @@ pub(crate) fn compile_pattern(pattern: &str) -> Result<Regex, PatternError> {
     if can_match_forbidden(&hir, &forbidden_unicode(), &forbidden_bytes()) {
         return Err(PatternError::TooBroad);
     }
-    build(&format!(r"\A(?:{pattern})\z"))
+    let re = build(&format!(r"\A(?:{pattern})\z"))?;
+    // An empty value carries nothing to check; a pattern that clears it
+    // clears an omitted value.
+    if re.is_match("") {
+        return Err(PatternError::MatchesEmpty);
+    }
+    Ok(re)
 }
 
 /// True when the value satisfies the constraint.
@@ -209,7 +220,8 @@ pub(crate) fn constraint_clears(c: &Constraint, value: &str) -> bool {
 }
 
 /// Names of tainted parameters that no bundle constraint for this action
-/// clears, in order. Anything but `Clean` counts as tainted.
+/// clears, in order. Anything but `Clean` counts as tainted. An empty
+/// tainted value is never cleared, whatever the constraint.
 pub(crate) fn uncleared_tainted<'a>(
     params: &'a [Param],
     action: &str,
@@ -219,9 +231,10 @@ pub(crate) fn uncleared_tainted<'a>(
         .iter()
         .filter(|p| !matches!(p.taint, Taint::Clean))
         .filter(|p| {
-            !constraints
-                .get(&(action.to_string(), p.name.clone()))
-                .is_some_and(|c| constraint_clears(c, &p.value))
+            p.value.is_empty()
+                || !constraints
+                    .get(&(action.to_string(), p.name.clone()))
+                    .is_some_and(|c| constraint_clears(c, &p.value))
         })
         .map(|p| p.name.as_str())
         .collect()
@@ -468,8 +481,6 @@ mod tests {
         assert!(!clears("a|b", "xb"));
         assert!(!clears("a|b", "ax"));
         assert!(clears("a|b", "b"));
-        assert!(clears("", ""));
-        assert!(!clears("", "a"));
     }
 
     #[test]
@@ -521,8 +532,9 @@ mod tests {
             );
         }
         for p in [
+            // Bundle authors spell word characters out: `\w` admits ZWJ.
+            "[a-z0-9_]+",
             "[a-z0-9/._-]+",
-            r"\w+",
             "[a-z ]{1,40}",
             "append|replace",
             r"(?-u:[a-z])+",
@@ -531,6 +543,63 @@ mod tests {
         ] {
             assert!(compile_pattern(p).is_ok(), "{p:?}");
         }
+    }
+
+    #[test]
+    fn format_separator_and_control_chars_are_refused() {
+        for p in [
+            r"\w+",
+            "[\u{200d}]",
+            "[\u{200c}]",
+            "[\u{200b}]",
+            "[\u{2028}]",
+            "[\u{2029}]",
+            "[\u{061c}]",
+            "[\u{feff}]",
+            "[\u{e0041}]",
+            r"\p{Cf}",
+            r"\p{Zl}",
+            r"[a-z\x{ad}]+",
+            "a\u{200d}b",
+        ] {
+            assert_eq!(
+                compile_pattern(p).unwrap_err(),
+                PatternError::TooBroad,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn patterns_matching_empty_are_refused() {
+        for p in ["", "a*", "(a|)", "[a-z]{0,3}", "a?", "(?:)"] {
+            assert_eq!(
+                compile_pattern(p).unwrap_err(),
+                PatternError::MatchesEmpty,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_tainted_value_is_never_cleared() {
+        let mut cs = Constraints::new();
+        cs.insert(
+            ("act".into(), "e".into()),
+            Constraint::Enum(vec![String::new(), "ok".into()]),
+        );
+        // Built past compile_pattern, which now refuses it.
+        cs.insert(
+            ("act".into(), "p".into()),
+            Constraint::Pattern(Regex::new(r"\A(?:a*)\z").unwrap()),
+        );
+        let params = vec![
+            Param::untrusted("e", "", vec![]),
+            Param::untrusted("p", "", vec![]),
+            Param::untrusted("e", "ok", vec![]),
+            Param::untrusted("p", "aa", vec![]),
+        ];
+        assert_eq!(uncleared_tainted(&params, "act", &cs), vec!["e", "p"]);
     }
 
     #[test]
@@ -566,6 +635,7 @@ mod tests {
                 crate::EntityRef::new("Worker", "w1"),
                 "j_edit",
                 crate::EntityRef::new("Path", "p"),
+                "run-1",
                 0,
             )
             .param(p)

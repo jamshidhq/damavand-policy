@@ -51,7 +51,7 @@ One namespace `Damavand` serves both products. Product extensions use their own 
 | Actions | Fixed verbs, each in exactly one class: `j_read`, `j_edit`, `run_command`, `git_push`, `http_request`, `k8s_apply`, `terraform_apply`, … MCP tools: `mcp_call` on a `Tool`, class from the manifest. |
 | Context | `autonomy: Long` (0-3, effective), `action_class: String`, `taint_unvalidated: Bool`, `tainted_params: Set<String>`, `budget: {tokens_left: Long, actions_left: Long}`, `run_id: String` |
 
-Bundle = git dir (`schema.cedarschema`, `global/`, `projects/<id>/`, `autonomy.toml`, `constraints.toml`, `approval.toml`). Bundle id = SHA-256 over the canonical content (length-prefixed, domain-separated; files sorted by name, projects by id; broker keys included), computed by `Engine::load`. The commit sha is kept as a human label. The loader validates strictly and refuses policies without `@id` or project policies not scoped `in Project::"<id>"`. Action ids match `[a-z][a-z0-9_.]*`.
+Bundle = git dir (`schema.cedarschema`, `global/`, `projects/<id>/`, `autonomy.toml`, `constraints.toml`, `approval.toml`). Bundle id = SHA-256 over the canonical content (length-prefixed, domain-separated; files sorted by name, projects by id; broker keys included), computed by `Engine::load`; the max grant TTL is in it too. The commit sha is kept as a human label. The loader validates strictly and refuses policies without `@id` or project policies not scoped `in Project::"<id>"`. Action ids match `[a-z][a-z0-9_.]*`.
 
 ## 2. Precedence and "ask"
 
@@ -60,7 +60,7 @@ Every pairwise tier conflict is allow against deny, and deny always wins. So the
 | Cedar result | Outcome |
 |---|---|
 | Deny, a hard `forbid` determined it | `Deny{rule}` |
-| Deny, only `@outcome("ask")` forbids determined it | `Escalate{PolicyAsk}` |
+| Deny, only `@outcome("ask")` forbids determined it | `Escalate{PolicyAsk}`, one reason per determining ask rule, sorted by `@id` |
 | Deny, no determining policy (no permit matched) | `Escalate{NoMatch}`: tier 5 "ask" |
 | Allow | candidate Allow, goes to the gates in section 3-4 |
 | Any entry in `errors()` | `Deny{rule: "damavand.eval_error"}` |
@@ -82,7 +82,7 @@ Tiers only pick the reported rule id: strongest tier, then lexical `@id`. Side e
 - The producer (core router, quarantine reader, tools part) sets taint. A parameter a model proposes after it read untrusted text is tainted.
 - Data: `Param {name, value, taint: Clean | Untrusted{sources}}`. `taint` is required; a request with any unknown field (such as `constraint`) is refused.
 - Constraints live in the bundle, `constraints.toml`, keyed by (action, parameter): one non-empty `enum` or one `pattern`. A parameter with no bundle constraint stays tainted.
-- Patterns are compiled at load: `regex` syntax, at most 1024 bytes, size and nest limits, compiled alone first (so `x)|(.*` fails), then anchored `\A(?:…)\z`. A pattern that can match a forbidden character is refused (`PatternTooBroad`): C0/C1 controls (newline included), DEL, bidi controls, and `` $ ` ; | & < > \ " ' ``. The check walks the parsed pattern and collects every character a literal or class can produce, so it over-approximates: `.*`, `(?s).*`, `.+`, `[\s\S]*`, `.*x` and `[^a]*` are refused; `[a-z0-9/._-]+` and `\w+` load. It does not judge breadth over safe characters: `[a-z ]+` loads and clears plain English. The bundle author owns that choice.
+- Patterns are compiled at load: `regex` syntax, at most 1024 bytes, size and nest limits, compiled alone first (so `x)|(.*` fails), then anchored `\A(?:…)\z`. A pattern that can match a forbidden character is refused (`PatternTooBroad`): every character in Unicode general category `Cc` (C0/C1 controls, newline, DEL), `Cf` (bidi controls, zero-width space and joiners, U+061C, U+FEFF, tag characters), `Zl` and `Zp` (line and paragraph separators), taken from the `regex-syntax` Unicode tables, and `` $ ` ; | & < > \ " ' ``. The check walks the parsed pattern and collects every character a literal or class can produce, so it over-approximates: `.*`, `(?s).*`, `.+`, `[\s\S]*`, `.*x`, `[^a]*` and `\w+` (it admits U+200C and U+200D) are refused; `[a-z0-9/._-]+` and `[a-z0-9_]+` load. Bundle authors write explicit ranges. A pattern that matches the empty string is refused (`PatternMatchesEmpty`), and an empty tainted value is never cleared, by an enum either. It does not judge breadth over safe characters: `[a-z ]+` loads and clears plain English. The bundle author owns that choice.
 - Rust checks the constraint before Cedar (`like` cannot). A match clears that parameter only.
 - A gate after Cedar: any uncleared tainted parameter turns Allow into `Escalate{TaintedParam, to: User}`. Policy content cannot change this.
 - A classifier has no input to `decide()` in v0.1, so it cannot allow.
@@ -92,7 +92,7 @@ Tiers only pick the reported rule id: strongest tier, then lexical `@id`. Side e
 1. `decide` returns `Escalate{reasons, to}`. `reasons` lists every reason, most severe first: TaintedParam > PolicyAsk > AutonomyRequiresApproval > NoMatch.
 2. The core shows the approver the request and all reasons. On approval, the **approval broker** in the core signs `grant_signing_bytes(bundle_id, request, reasons, approver, expires_at, nonce)` with its Ed25519 key. The bytes are canonical and length-prefixed (no maps, no floats): domain tag, bundle id, run id, request digest (principal, action, resource, every parameter's name, value and taint), entities digest (sorted entities, parents and attribute keys; a float attribute has no digest, so no grant), every reason with its rule id or parameter name, approver, `expires_at`, nonce.
 3. The core re-sends the request with `approval: {approver, expiresAt, nonce, signature}`.
-4. The engine recomputes the bytes from **its own** bundle id, the request and its own reasons, and lifts Escalate to `Allow{notify: true}` only when one bundle broker key verifies the signature (`verify_strict`), the approver ranks at least `to`, and `now < expiresAt`. A grant never lifts Deny. A bundle with no broker key accepts no grant.
+4. The engine recomputes the bytes from **its own** bundle id, the request and its own reasons, and lifts Escalate to `Allow{notify: true}` only when one bundle broker key verifies the signature (`verify_strict`), the approver ranks at least `to`, and `now < expiresAt <= now + max_grant_ttl` (`approval.toml`, default 3600 seconds; a longer grant does not lift). A grant never lifts Deny. A bundle with no broker key accepts no grant.
 5. The Allow carries the nonce (`DecisionRecord::grant_nonce`, wire `grantNonce`). **The engine is stateless and cannot see a replay.** The core must consume the nonce atomically (insert-if-absent in its store) before it acts, and treat a nonce it has seen as Deny.
 
 The engine holds only public keys (`approval.toml`, in the bundle and so in the bundle id). `DecisionRequest::digest()` stays public: knowing it does not let anyone sign.
@@ -108,7 +108,8 @@ impl Engine {
 }
 #[non_exhaustive] pub struct DecisionRequest { principal, action: ActionRef,
     resource: ResourceRef, params: Vec<Param>, autonomy_override: Option<Autonomy>,
-    budget: Budget, run_id: RunId, now: u64, approval: Option<Grant> }
+    budget: Budget, run_id: String /* required, non-empty */, now: u64,
+    approval: Option<Grant> }
 #[non_exhaustive] pub enum Decision {
     Allow    { notify: bool, record: DecisionRecord },
     Deny     { rule: RuleId, record: DecisionRecord },
@@ -223,6 +224,32 @@ ways:
   3.0.0: 3.0.0 pulls `sha2`/`digest` 0.11 next to cedar's build-time
   `digest` 0.10, a duplicate `cargo deny` refuses. `regex-syntax` (already in
   the tree through `regex`) parses patterns for the breadth check.
+- **Run id.** `runId` is required on the wire and must not be empty; an
+  empty one is `Deny(damavand.request_invalid)`, checked after the Never and
+  unknown-action gates. A grant signs the run id, and an empty one bound a
+  grant to no run.
+- **Ask reasons.** Every determining `@outcome("ask")` rule is its own
+  `PolicyAsk` reason, sorted by `@id`, so the approver sees each rule and the
+  grant signs each one. Before, only the lowest id was reported.
+- **Pattern breadth.** The forbidden set is the Unicode categories `Cc`,
+  `Cf`, `Zl` and `Zp` plus the shell metacharacters, built from the
+  `regex-syntax` property tables rather than a hand list of ranges. `\w` is
+  refused because it admits ZWJ and ZWNJ. Patterns that match the empty
+  string are refused at load, and an empty tainted value never clears.
+- **Grant TTL.** `approval.toml` may set `max_grant_ttl` (seconds, at least
+  1; default 3600). A grant with `expiresAt - now` above it does not lift,
+  so a broker bug that mints a far-future expiry is bounded. The value is in
+  the bundle id (domain tag `bundle/v2`).
+- **Not signed: `budget` and `autonomyOverride`.** Both come from the core,
+  not the agent (section 0), and neither is in the grant bytes. The override
+  only lowers the level: a lower level yields a weaker outcome or Deny, and a
+  grant never lifts Deny. A change to either that alters the escalation's
+  reasons or approver breaks the signature, because both are signed. What
+  remains is a change that keeps the same reasons, for example a budget an
+  ask rule reads that moved between the approval and the re-send. The
+  approver approved exactly those reasons for this request, the nonce is
+  single-use and the grant lives at most `max_grant_ttl`, so the gap is one
+  re-send of an approved action under a budget the core itself reports.
 - **MCP tools.** `mcp_call` with a class from the manifest is not in v0.1; it
   waits for the manifest crate.
 - **damavand-proto.** Not a dependency in v0.1 (it is unpublished). The wire

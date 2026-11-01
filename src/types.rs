@@ -464,8 +464,10 @@ pub struct DecisionRequest {
     /// Remaining budget.
     #[serde(default)]
     pub budget: Budget,
-    /// Run id, passed to policies as context.
-    #[serde(default)]
+    /// Run id, from the core. Required on the wire and must not be empty:
+    /// a grant signs it, so it binds the grant to one run. The engine denies
+    /// an empty one (`damavand.request_invalid`). Passed to policies as
+    /// context.
     pub run_id: String,
     /// Current time, Unix seconds, from the core's clock. Required: grant
     /// expiry is checked against it, so `decide` stays deterministic.
@@ -477,11 +479,13 @@ pub struct DecisionRequest {
 
 impl DecisionRequest {
     /// Make a request with no entities, parameters, override or approval.
-    /// `now` is the core's clock in Unix seconds.
+    /// `run_id` is the core's run id (not empty); `now` is the core's clock
+    /// in Unix seconds.
     pub fn new(
         principal: EntityRef,
         action: impl Into<String>,
         resource: EntityRef,
+        run_id: impl Into<String>,
         now: u64,
     ) -> Self {
         Self {
@@ -492,7 +496,7 @@ impl DecisionRequest {
             params: Vec::new(),
             autonomy_override: None,
             budget: Budget::default(),
-            run_id: String::new(),
+            run_id: run_id.into(),
             now,
             approval: None,
         }
@@ -548,7 +552,8 @@ impl DecisionRequest {
 pub enum EscalateReason {
     /// No permit matched (precedence tier 5, "ask").
     NoMatch,
-    /// Only `@outcome("ask")` forbids determined the result.
+    /// Only `@outcome("ask")` forbids determined the result. One reason per
+    /// determining ask rule, sorted by rule id.
     PolicyAsk(RuleId),
     /// Autonomy L2: the action needs approval.
     AutonomyRequiresApproval,

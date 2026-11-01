@@ -67,18 +67,22 @@ pub(crate) fn verifying_key(key: &BrokerKey) -> Option<VerifyingKey> {
 }
 
 /// True when the grant lifts this escalation: the approver ranks at least
-/// `to`, `now` is before `expires_at`, and one broker key verifies the
-/// signature (strictly) over the bytes recomputed from this bundle, request
-/// and reason list.
+/// `to`, `now` is before `expires_at`, `expires_at` is at most `max_ttl`
+/// seconds past `now`, and one broker key verifies the signature (strictly)
+/// over the bytes recomputed from this bundle, request and reason list.
 pub(crate) fn grant_lifts(
     keys: &[VerifyingKey],
+    max_ttl: u64,
     bundle: &BundleId,
     req: &DecisionRequest,
     grant: &Grant,
     reasons: &[EscalateReason],
     to: Approver,
 ) -> bool {
-    if grant.approver < to || req.now >= grant.expires_at {
+    if grant.approver < to
+        || req.now >= grant.expires_at
+        || grant.expires_at.saturating_sub(req.now) > max_ttl
+    {
         return false;
     }
     let Some(msg) = grant_signing_bytes(

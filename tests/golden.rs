@@ -42,7 +42,7 @@ fn a_wrong_expectation_is_reported() {
     let suite: Suite = serde_json::from_value(serde_json::json!({"cases": [{
         "name": "a detached worker is not allowed",
         "request": {"principal": {"type": "Worker", "id": "w1"}, "action": "j_read",
-                    "resource": {"type": "Path", "id": "p"}, "now": 1},
+                    "resource": {"type": "Path", "id": "p"}, "runId": "r", "now": 1},
         "expect": {"outcome": "allow", "rule": "nope", "to": "user", "reason": "noMatch", "param": "x", "notify": true}
     }]}))
     .unwrap();
@@ -60,7 +60,7 @@ fn a_wrong_expectation_is_reported() {
     assert!(
         serde_json::from_value::<Suite>(serde_json::json!({"cases": [{
         "name": "n", "request": {"principal": {"type": "W", "id": "w"}, "action": "a",
-        "resource": {"type": "R", "id": "r"}, "now": 1}, "expect": {"outcome": "allow", "unknownField": true}}]}))
+        "resource": {"type": "R", "id": "r"}, "runId": "r", "now": 1}, "expect": {"outcome": "allow", "unknownField": true}}]}))
         .is_err()
     );
 }

@@ -38,7 +38,13 @@ fn missing_entity_attribute_error_denies() {
         "{PERMIT_ALL}\n@id(\"depth\") forbid (principal is Damavand::Orchestrator, action, resource) \
          when {{ principal.depth == \"x\" }};"
     ));
-    let req = DecisionRequest::new(r("Orchestrator", "ghost"), "j_read", lib(), common::NOW);
+    let req = DecisionRequest::new(
+        r("Orchestrator", "ghost"),
+        "j_read",
+        lib(),
+        "run-1",
+        common::NOW,
+    );
     assert_eq!(deny_rule(&e.decide(&req)), RuleId::EVAL_ERROR);
 }
 
@@ -189,18 +195,17 @@ fn hard_forbid_beats_ask() {
 }
 
 #[test]
-fn ask_reports_the_lowest_ask_rule() {
+fn ask_reports_every_ask_rule_sorted() {
     let e = load(
         r#"@id("all") permit (principal, action, resource);
+           @id("c.ask") @outcome("ask") forbid (principal, action, resource);
            @id("b.ask") @outcome("ask") forbid (principal, action, resource);
            @id("a.ask") @outcome("ask") forbid (principal, action, resource);"#,
     );
+    let ask = |id: &str| EscalateReason::PolicyAsk(RuleId(id.into()));
     match e.decide(&request(w1(), "j_read", lib())) {
         Decision::Escalate { reasons, to, .. } => {
-            assert_eq!(
-                reasons,
-                vec![EscalateReason::PolicyAsk(RuleId("a.ask".into()))]
-            );
+            assert_eq!(reasons, vec![ask("a.ask"), ask("b.ask"), ask("c.ask")]);
             assert_eq!(to, Approver::User);
         }
         other => panic!("{other:?}"),
@@ -238,31 +243,32 @@ fn granted_record_is_marked() {
 
 #[test]
 fn digest_covers_every_bound_field() {
-    let base = DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
+    let base = DecisionRequest::new(w1(), "j_edit", lib(), "run-1", common::NOW)
         .param(Param::clean("a", "1"))
         .param(Param::clean("b", "2"));
     let d0 = base.digest();
     let variants = [
-        DecisionRequest::new(r("Worker", "w2"), "j_edit", lib(), common::NOW)
+        DecisionRequest::new(r("Worker", "w2"), "j_edit", lib(), "run-1", common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(r("User", "w1"), "j_edit", lib(), common::NOW)
+        DecisionRequest::new(r("User", "w1"), "j_edit", lib(), "run-1", common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_read", lib(), common::NOW)
+        DecisionRequest::new(w1(), "j_read", lib(), "run-1", common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", repo(), common::NOW)
+        DecisionRequest::new(w1(), "j_edit", repo(), "run-1", common::NOW)
             .param(Param::clean("a", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
+        DecisionRequest::new(w1(), "j_edit", lib(), "run-1", common::NOW)
             .param(Param::clean("x", "1"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
+        DecisionRequest::new(w1(), "j_edit", lib(), "run-1", common::NOW)
             .param(Param::clean("a", "9"))
             .param(Param::clean("b", "2")),
-        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW).param(Param::clean("a", "1")),
-        DecisionRequest::new(w1(), "j_edit", lib(), common::NOW)
+        DecisionRequest::new(w1(), "j_edit", lib(), "run-1", common::NOW)
+            .param(Param::clean("a", "1")),
+        DecisionRequest::new(w1(), "j_edit", lib(), "run-1", common::NOW)
             .param(Param::clean("a", "12"))
             .param(Param::clean("b", "")),
     ];
@@ -292,9 +298,9 @@ fn digest_covers_every_bound_field() {
 #[test]
 fn unknown_entity_type_is_request_invalid() {
     let e = load(PERMIT_ALL);
-    let req = DecisionRequest::new(r("Martian", "x"), "j_read", lib(), common::NOW);
+    let req = DecisionRequest::new(r("Martian", "x"), "j_read", lib(), "run-1", common::NOW);
     assert_eq!(deny_rule(&e.decide(&req)), RuleId::REQUEST_INVALID);
-    let req = DecisionRequest::new(w1(), "j_read", r("Bad Type", "x"), common::NOW);
+    let req = DecisionRequest::new(w1(), "j_read", r("Bad Type", "x"), "run-1", common::NOW);
     assert_eq!(deny_rule(&e.decide(&req)), RuleId::REQUEST_INVALID);
 }
 
@@ -342,14 +348,14 @@ fn worker_without_orchestrator_or_loop_is_a_topology_deny() {
     let e = load(
         r#"@id("none") forbid (principal, action == Damavand::Action::"git_push", resource);"#,
     );
-    let req = DecisionRequest::new(r("Worker", "lone"), "j_read", lib(), common::NOW)
+    let req = DecisionRequest::new(r("Worker", "lone"), "j_read", lib(), "run-1", common::NOW)
         .entity(damavand_policy::Entity::new(r("Worker", "lone")));
     assert_eq!(deny_rule(&e.decide(&req)), RuleId::TOPOLOGY);
     // Not in the entity list at all: no ancestors either.
-    let ghost = DecisionRequest::new(r("Worker", "ghost"), "j_read", lib(), common::NOW);
+    let ghost = DecisionRequest::new(r("Worker", "ghost"), "j_read", lib(), "run-1", common::NOW);
     assert_eq!(deny_rule(&e.decide(&ghost)), RuleId::TOPOLOGY);
     // In a loop only: placed.
-    let looped = DecisionRequest::new(r("Worker", "l"), "j_read", lib(), common::NOW)
+    let looped = DecisionRequest::new(r("Worker", "l"), "j_read", lib(), "run-1", common::NOW)
         .entity(damavand_policy::Entity::new(r("Worker", "l")).parent(r("Loop", "nightly")));
     assert!(matches!(
         e.decide(&looped),
@@ -358,7 +364,7 @@ fn worker_without_orchestrator_or_loop_is_a_topology_deny() {
             ..
         }
     ));
-    let user = DecisionRequest::new(r("User", "max"), "j_read", lib(), common::NOW);
+    let user = DecisionRequest::new(r("User", "max"), "j_read", lib(), "run-1", common::NOW);
     assert!(matches!(
         e.decide(&user),
         Decision::Escalate {
@@ -443,7 +449,7 @@ fn request_round_trips_through_json() {
     assert_eq!(back, req);
     let minimal = serde_json::json!({
         "principal": {"type": "Worker", "id": "w"}, "action": "a",
-        "resource": {"type": "Repo", "id": "r"}, "now": 1
+        "resource": {"type": "Repo", "id": "r"}, "runId": "run-1", "now": 1
     });
     assert!(serde_json::from_value::<DecisionRequest>(minimal.clone()).is_ok());
     let with = |k: &str, v: serde_json::Value| {
@@ -453,16 +459,21 @@ fn request_round_trips_through_json() {
     };
     assert!(with("autonomyOverride", serde_json::json!(4)).is_err());
     assert!(with("unknownField", serde_json::json!(1)).is_err());
-    let mut no_now = minimal.clone();
-    no_now.as_object_mut().unwrap().remove("now");
-    assert!(serde_json::from_value::<DecisionRequest>(no_now).is_err());
+    for required in ["now", "runId"] {
+        let mut without = minimal.clone();
+        without.as_object_mut().unwrap().remove(required);
+        assert!(
+            serde_json::from_value::<DecisionRequest>(without).is_err(),
+            "{required}"
+        );
+    }
 }
 
 #[test]
 fn worker_escalation_follows_its_own_orchestrator() {
     let e = load("");
     let to = |entities: Vec<damavand_policy::Entity>| {
-        let mut req = DecisionRequest::new(w1(), "j_read", lib(), common::NOW);
+        let mut req = DecisionRequest::new(w1(), "j_read", lib(), "run-1", common::NOW);
         for ent in entities {
             req = req.entity(ent);
         }
@@ -494,7 +505,7 @@ fn worker_escalation_follows_its_own_orchestrator() {
     );
     // An orchestrator of unknown depth is refused, even off the path.
     for (path, extra) in [("odd", "main"), ("main", "odd")] {
-        let mut req = DecisionRequest::new(w1(), "j_read", lib(), common::NOW)
+        let mut req = DecisionRequest::new(w1(), "j_read", lib(), "run-1", common::NOW)
             .entity(orch("main", "main"))
             .entity(damavand_policy::Entity::new(w1()).parent(r("Orchestrator", path)));
         req = req.entity(orch(&format!("x{extra}"), extra));

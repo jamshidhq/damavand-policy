@@ -6,7 +6,7 @@ mod common;
 use common::{NOW, SCHEMA, id, lib, load, r, request, w1};
 use damavand_policy::{
     Approver, Autonomy, Bundle, BundleId, Decision, DecisionRequest, Engine, EscalateReason, Grant,
-    GrantNonce, GrantSignature, Outcome,
+    GrantNonce, GrantSignature, LoadError, RuleId,
 };
 use serde_json::json;
 
@@ -14,6 +14,18 @@ const PERMIT_ALL: &str = r#"@id("all") permit (principal, action, resource);"#;
 
 fn wire(req: &DecisionRequest) -> serde_json::Value {
     serde_json::to_value(req).unwrap()
+}
+
+/// The decision with its UUIDv7 blanked, so two decisions compare by
+/// content: outcome, reasons, approver, rule ids, digest and grant fields.
+fn content(mut d: Decision) -> Decision {
+    match &mut d {
+        Decision::Allow { record, .. }
+        | Decision::Deny { record, .. }
+        | Decision::Escalate { record, .. } => record.decision_id.clear(),
+        _ => unreachable!("a new Decision variant"),
+    }
+    d
 }
 
 /// B1: the caller sends its own match-all constraint to clear its own taint.
@@ -34,7 +46,16 @@ fn b1_caller_constraint_does_not_clear_taint() {
     // Without the constraint the same parameter stays tainted.
     v["params"][0].as_object_mut().unwrap().remove("constraint");
     let req: DecisionRequest = serde_json::from_value(v).unwrap();
-    assert!(!e.decide(&req).is_allow());
+    match e.decide(&req) {
+        Decision::Escalate { to, reasons, .. } => {
+            assert_eq!(to, Approver::User);
+            assert_eq!(
+                reasons,
+                vec![EscalateReason::TaintedParam("content".into())]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// B2: a parameter that omits `taint` must not be treated as clean.
@@ -79,6 +100,7 @@ fn b3_grant_is_bound_to_everything_it_signs() {
             common::sign_raw(seed, bundle, r, rs, a, exp, [9; 16])
         };
     let exp = NOW + 60;
+    let ungranted = content(e.decide(&req));
     let good = sign(&seed, e.bundle_id(), &req, &reasons, Approver::User, exp);
     let d = e.decide(&req.clone().approval(good.clone()));
     assert!(d.is_allow(), "{d:?}");
@@ -193,13 +215,13 @@ fn b3_grant_is_bound_to_everything_it_signs() {
     ];
     for (name, g) in cases {
         let d = e.decide(&req.clone().approval(g));
-        assert!(!d.is_allow(), "{name}: {d:?}");
-        assert_eq!(d.record().grant_nonce, None, "{name}");
+        assert_eq!(content(d), ungranted, "{name}");
     }
     // The core's clock decides expiry: the same grant fails later.
-    let mut late = req.clone().approval(good);
+    let mut late = req.clone();
     late.now = exp;
-    assert!(!e.decide(&late).is_allow());
+    let late_ungranted = content(e.decide(&late));
+    assert_eq!(content(e.decide(&late.approval(good))), late_ungranted);
 }
 
 /// B3: replay. The engine is stateless, so the same grant on the same
@@ -273,23 +295,141 @@ fn b3_float_attribute_blocks_grants() {
     assert!(!e.decide(&floaty).is_allow());
 }
 
+/// The run id is required on the wire and must not be empty: it binds a
+/// grant to its run, and an empty one binds nothing.
+#[test]
+fn run_id_is_required_and_not_empty() {
+    let e = load(PERMIT_ALL);
+    let mut v = wire(&request(w1(), "j_read", lib()).run_id("run-1"));
+    v.as_object_mut().unwrap().remove("runId");
+    assert!(
+        serde_json::from_value::<DecisionRequest>(v).is_err(),
+        "a request without runId parsed"
+    );
+    let req = request(w1(), "j_edit", lib())
+        .autonomy_override(Autonomy::L2ActWithApproval)
+        .run_id("");
+    let g = common::sign_raw(
+        &common::broker_seed(),
+        e.bundle_id(),
+        &req,
+        &[EscalateReason::AutonomyRequiresApproval],
+        Approver::User,
+        NOW + 60,
+        [3; 16],
+    );
+    for q in [req.clone(), req.approval(g)] {
+        match e.decide(&q) {
+            Decision::Deny { rule, .. } => assert_eq!(rule.as_str(), RuleId::REQUEST_INVALID),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// Every ask rule that determined the escalation reaches the approver and
+/// the signed reasons: a grant over only some of them does not lift.
+#[test]
+fn every_ask_rule_is_signed() {
+    let e = load(&format!(
+        "{PERMIT_ALL}\n@id(\"b.ask\") @outcome(\"ask\") forbid (principal, action, resource);\n\
+         @id(\"a.ask\") @outcome(\"ask\") forbid (principal, action, resource);"
+    ));
+    let req = request(w1(), "j_read", lib()).run_id("run-1");
+    let ask = |id: &str| EscalateReason::PolicyAsk(RuleId(id.into()));
+    let all = vec![ask("a.ask"), ask("b.ask")];
+    assert_eq!(common::reasons(&e, &req), all);
+    let sign = |rs: &[EscalateReason]| {
+        common::sign_raw(
+            &common::broker_seed(),
+            e.bundle_id(),
+            &req,
+            rs,
+            Approver::User,
+            NOW + 60,
+            [5; 16],
+        )
+    };
+    assert!(!e.decide(&req.clone().approval(sign(&all[..1]))).is_allow());
+    assert!(e.decide(&req.clone().approval(sign(&all))).is_allow());
+}
+
+/// A grant lives at most the bundle's max grant TTL (default one hour)
+/// past `now`; a longer one does not lift.
+#[test]
+fn b3_grant_ttl_is_capped() {
+    let e = load(PERMIT_ALL);
+    let req = request(w1(), "j_edit", lib())
+        .autonomy_override(Autonomy::L2ActWithApproval)
+        .run_id("run-1");
+    let reasons = common::reasons(&e, &req);
+    let sign = |exp| {
+        common::sign_raw(
+            &common::broker_seed(),
+            e.bundle_id(),
+            &req,
+            &reasons,
+            Approver::User,
+            exp,
+            [4; 16],
+        )
+    };
+    assert!(e.decide(&req.clone().approval(sign(NOW + 3600))).is_allow());
+    for exp in [NOW + 3601, u64::MAX] {
+        let d = e.decide(&req.clone().approval(sign(exp)));
+        assert!(!d.is_allow(), "{exp}: {d:?}");
+    }
+    // A bundle sets a shorter cap; the grant is signed for that bundle.
+    let short = Engine::load(&common::bundle(PERMIT_ALL).with_max_grant_ttl(30)).unwrap();
+    let sign_short = |exp| {
+        common::sign_raw(
+            &common::broker_seed(),
+            short.bundle_id(),
+            &req,
+            &reasons,
+            Approver::User,
+            exp,
+            [4; 16],
+        )
+    };
+    assert!(
+        short
+            .decide(&req.clone().approval(sign_short(NOW + 30)))
+            .is_allow()
+    );
+    assert!(
+        !short
+            .decide(&req.clone().approval(sign_short(NOW + 31)))
+            .is_allow()
+    );
+    assert!(matches!(
+        Engine::load(&common::bundle(PERMIT_ALL).with_max_grant_ttl(0)),
+        Err(LoadError::Approval { .. })
+    ));
+}
+
 /// S1: an orchestrator depth outside {main, child} is refused, not trusted.
 #[test]
 fn s1_unknown_depth_is_refused() {
     let e = load("");
-    let req = DecisionRequest::new(w1(), "j_read", lib(), common::NOW)
+    let req = DecisionRequest::new(w1(), "j_read", lib(), "run-1", common::NOW)
         .entity(damavand_policy::Entity::new(r("Orchestrator", "o")).attr("depth", json!("root")))
         .entity(damavand_policy::Entity::new(w1()).parent(r("Orchestrator", "o")));
-    assert_eq!(e.decide(&req).outcome(), Outcome::Deny);
+    match e.decide(&req) {
+        Decision::Deny { rule, .. } => assert_eq!(rule.as_str(), RuleId::TOPOLOGY),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// S1: a worker outside any orchestrator or loop is refused.
 #[test]
 fn s1_detached_worker_is_refused() {
     let e = load(PERMIT_ALL);
-    let req = DecisionRequest::new(r("Worker", "lone"), "j_read", lib(), common::NOW)
+    let req = DecisionRequest::new(r("Worker", "lone"), "j_read", lib(), "run-1", common::NOW)
         .entity(damavand_policy::Entity::new(r("Worker", "lone")));
-    assert_eq!(e.decide(&req).outcome(), Outcome::Deny);
+    match e.decide(&req) {
+        Decision::Deny { rule, .. } => assert_eq!(rule.as_str(), RuleId::TOPOLOGY),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// S3: a bundle cannot permit a Never verb by name.
@@ -299,9 +439,9 @@ fn s3_permit_on_never_is_refused() {
         "g.cedar",
         r#"@id("p") permit (principal, action == Damavand::Action::"terraform_apply", resource);"#,
     );
-    assert!(
-        Engine::load(&b).is_err(),
-        "bundle permitting a Never verb loaded"
+    assert_eq!(
+        Engine::load(&b).unwrap_err(),
+        LoadError::PermitsNever { id: "p".into() }
     );
 }
 
@@ -310,27 +450,34 @@ fn s3_permit_on_never_is_refused() {
 fn s3_odd_action_id_is_refused() {
     let schema = SCHEMA.replace("action draft_pr in", "action \"Draft PR\" in");
     assert_ne!(schema, SCHEMA);
-    assert!(Engine::load(&Bundle::new(id(), schema)).is_err());
+    assert_eq!(
+        Engine::load(&Bundle::new(id(), schema)).unwrap_err(),
+        LoadError::ActionId {
+            action: "Draft PR".into()
+        }
+    );
 }
 
-/// S3: tofu_apply is Never whatever class the bundle gives it.
+/// S3: tofu_apply is Never whatever class the bundle gives it: the loader
+/// refuses the bundle that moves it out of `class:never`.
 #[test]
 fn s3_tofu_apply_is_never() {
     let schema = SCHEMA.replace(
         "action use_secret in",
         "action tofu_apply in [\"class:write.remote\"] appliesTo {\n    principal: [Worker, Orchestrator, User], resource: [Repo], context: Ctx };\n  action use_secret in",
     );
-    match Engine::load(
+    assert_ne!(schema, SCHEMA);
+    let loaded = Engine::load(
         &Bundle::new(id(), schema)
             .with_global("g.cedar", PERMIT_ALL)
             .with_autonomy(common::FULL_CAPS),
-    ) {
-        Err(_) => {}
-        Ok(e) => assert!(
-            !e.decide(&request(w1(), "tofu_apply", common::repo()))
-                .is_allow()
-        ),
-    }
+    );
+    assert_eq!(
+        loaded.unwrap_err(),
+        LoadError::NeverReclassified {
+            action: "tofu_apply".into()
+        }
+    );
 }
 
 /// S4: two bundles with different content never share an id.

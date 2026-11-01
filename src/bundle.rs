@@ -39,10 +39,13 @@ pub(crate) struct PolicyFile {
 /// pattern = "[a-z0-9/._-]+"
 /// ```
 ///
-/// `approval.toml` lists the approval broker's Ed25519 public keys:
+/// `approval.toml` lists the approval broker's Ed25519 public keys and,
+/// optionally, the longest grant lifetime in seconds past the request's
+/// `now` ([`DEFAULT_MAX_GRANT_TTL`] when absent):
 ///
 /// ```toml
 /// broker_keys = ["<64 hex characters>"]
+/// max_grant_ttl = 3600
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bundle {
@@ -53,7 +56,12 @@ pub struct Bundle {
     pub(crate) autonomy: String,
     pub(crate) constraints: String,
     pub(crate) broker_keys: Vec<BrokerKey>,
+    pub(crate) max_grant_ttl: u64,
 }
+
+/// Longest grant lifetime, in seconds past the request's `now`, when the
+/// bundle does not set `max_grant_ttl`: one hour.
+pub const DEFAULT_MAX_GRANT_TTL: u64 = 3600;
 
 impl Bundle {
     /// A bundle with a schema and no policies, caps, constraints or broker
@@ -68,6 +76,7 @@ impl Bundle {
             autonomy: String::new(),
             constraints: String::new(),
             broker_keys: Vec::new(),
+            max_grant_ttl: DEFAULT_MAX_GRANT_TTL,
         }
     }
 
@@ -115,6 +124,14 @@ impl Bundle {
         self
     }
 
+    /// Set the longest grant lifetime in seconds past the request's `now`.
+    /// A grant whose `expires_at` lies further out does not lift. It must be
+    /// at least 1; [`crate::Engine::load`] refuses 0.
+    pub fn with_max_grant_ttl(mut self, seconds: u64) -> Self {
+        self.max_grant_ttl = seconds;
+        self
+    }
+
     /// The human label.
     pub fn label(&self) -> &str {
         &self.label
@@ -137,7 +154,7 @@ impl Bundle {
             }
         }
         let mut h = Sha256::new();
-        feed(&mut h, b"damavand-policy/bundle/v1");
+        feed(&mut h, b"damavand-policy/bundle/v2");
         feed(&mut h, self.schema.as_bytes());
         feed(&mut h, self.autonomy.as_bytes());
         feed(&mut h, self.constraints.as_bytes());
@@ -145,6 +162,7 @@ impl Bundle {
         for k in &self.broker_keys {
             feed(&mut h, &k.0);
         }
+        h.update(self.max_grant_ttl.to_be_bytes());
         files(&mut h, &self.global);
         h.update((self.projects.len() as u64).to_be_bytes());
         for (id, fs) in &self.projects {
@@ -175,8 +193,12 @@ impl Bundle {
         let mut bundle = Bundle::new(label, schema)
             .with_autonomy(optional("autonomy.toml")?)
             .with_constraints(optional("constraints.toml")?);
-        for key in parse_approval(&optional("approval.toml")?)? {
+        let (keys, ttl) = parse_approval(&optional("approval.toml")?)?;
+        for key in keys {
             bundle = bundle.with_broker_key(key);
+        }
+        if let Some(ttl) = ttl {
+            bundle = bundle.with_max_grant_ttl(ttl);
         }
         for (name, text) in cedar_files(&dir.join("global"), read)? {
             bundle = bundle.with_global(format!("global/{name}"), text);
@@ -195,12 +217,23 @@ impl Bundle {
     }
 }
 
-/// `approval.toml`: `broker_keys = ["<hex>", ...]` and nothing else.
-fn parse_approval(text: &str) -> Result<Vec<BrokerKey>, LoadError> {
+/// `approval.toml`: `broker_keys = ["<hex>", ...]`, optional
+/// `max_grant_ttl = <seconds, at least 1>`, and nothing else.
+fn parse_approval(text: &str) -> Result<(Vec<BrokerKey>, Option<u64>), LoadError> {
     let bad = |message: String| LoadError::Approval { message };
     let table: toml::Table = toml::from_str(text).map_err(|e| bad(e.message().to_string()))?;
     let mut keys = Vec::new();
+    let mut ttl = None;
     for (k, v) in table {
+        if k == "max_grant_ttl" {
+            let secs = v
+                .as_integer()
+                .and_then(|n| u64::try_from(n).ok())
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| bad("max_grant_ttl is a number of seconds, at least 1".into()))?;
+            ttl = Some(secs);
+            continue;
+        }
         if k != "broker_keys" {
             return Err(bad(format!("unknown key {k:?}")));
         }
@@ -215,7 +248,7 @@ fn parse_approval(text: &str) -> Result<Vec<BrokerKey>, LoadError> {
             keys.push(key);
         }
     }
-    Ok(keys)
+    Ok((keys, ttl))
 }
 
 fn file_name(p: &Path) -> String {
@@ -354,15 +387,26 @@ pub enum LoadError {
         /// The parameter.
         param: String,
     },
-    /// A constraint pattern can match a control character, a bidi control or
-    /// a shell metacharacter, so it would clear arbitrary text.
+    /// A constraint pattern can match a character in Unicode category `Cc`,
+    /// `Cf`, `Zl` or `Zp` (controls, format characters such as bidi controls
+    /// and zero-width joiners, line and paragraph separators) or a shell
+    /// metacharacter, so it would clear arbitrary text. `\w` is refused: it
+    /// admits U+200C and U+200D; spell the range out, as `[a-z0-9_]`.
     PatternTooBroad {
         /// The action.
         action: String,
         /// The parameter.
         param: String,
     },
-    /// `approval.toml` is invalid.
+    /// A constraint pattern matches the empty string, so it would clear an
+    /// empty value.
+    PatternMatchesEmpty {
+        /// The action.
+        action: String,
+        /// The parameter.
+        param: String,
+    },
+    /// `approval.toml` is invalid, or the max grant TTL is 0.
     Approval {
         /// What is wrong.
         message: String,
@@ -423,6 +467,12 @@ impl fmt::Display for LoadError {
             }
             LoadError::PatternTooBroad { action, param } => {
                 write!(f, "constraint {action}.{param}: pattern is too broad")
+            }
+            LoadError::PatternMatchesEmpty { action, param } => {
+                write!(
+                    f,
+                    "constraint {action}.{param}: pattern matches the empty string"
+                )
             }
             LoadError::Approval { message } => write!(f, "approval.toml: {message}"),
             LoadError::BrokerKey { index } => write!(f, "broker key {index} is not valid"),

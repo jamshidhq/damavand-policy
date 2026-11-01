@@ -148,6 +148,7 @@ pub struct Engine {
     label: String,
     constraints: Constraints,
     broker_keys: Vec<VerifyingKey>,
+    max_grant_ttl: u64,
     schema: Schema,
     policies: PolicySet,
     meta: HashMap<PolicyId, Meta>,
@@ -222,6 +223,10 @@ fn parse_constraints(
                             param: param.clone(),
                         },
                         PatternError::TooBroad => LoadError::PatternTooBroad {
+                            action: action.clone(),
+                            param: param.clone(),
+                        },
+                        PatternError::MatchesEmpty => LoadError::PatternMatchesEmpty {
                             action: action.clone(),
                             param: param.clone(),
                         },
@@ -314,11 +319,17 @@ impl Engine {
             .enumerate()
             .map(|(index, k)| verifying_key(k).ok_or(LoadError::BrokerKey { index }))
             .collect::<Result<Vec<_>, _>>()?;
+        if bundle.max_grant_ttl == 0 {
+            return Err(LoadError::Approval {
+                message: "max_grant_ttl must be at least 1".into(),
+            });
+        }
         Ok(Engine {
             bundle_id: bundle.digest(),
             label: bundle.label.clone(),
             constraints,
             broker_keys,
+            max_grant_ttl: bundle.max_grant_ttl,
             schema,
             policies,
             meta,
@@ -377,7 +388,7 @@ impl Engine {
                 return Err(LoadError::NeverReclassified { action: id });
             }
             let sample =
-                DecisionRequest::new(EntityRef::new("", ""), "", EntityRef::new("", ""), 0);
+                DecisionRequest::new(EntityRef::new("", ""), "", EntityRef::new("", ""), "", 0);
             let ctx = context_json(Autonomy::L0Observe, class, &sample, &["p"]);
             if Context::from_json_value(ctx, Some((schema, a))).is_err() {
                 return Err(LoadError::ContextShape { action: id });
@@ -509,6 +520,10 @@ impl Engine {
             return builtin(RuleId::NEVER, record);
         }
 
+        // The run id binds a grant to its run; an empty one binds nothing.
+        if req.run_id.is_empty() {
+            return builtin(RuleId::REQUEST_INVALID, record);
+        }
         let Some((request, entities, level)) = self.cedar_request(req, class) else {
             return builtin(RuleId::REQUEST_INVALID, record);
         };
@@ -536,9 +551,15 @@ impl Engine {
             CedarDecision::Deny => {
                 if let Some(hard) = determining.iter().find(|m| !m.ask) {
                     Verdict::Deny(hard.rule.clone())
-                } else if let Some(ask) = determining.first() {
+                } else if !determining.is_empty() {
+                    // Every ask rule reaches the approver and the signed
+                    // reasons, sorted by rule id.
+                    let mut asks: Vec<RuleId> =
+                        determining.iter().map(|m| m.rule.clone()).collect();
+                    asks.sort();
+                    asks.dedup();
                     Verdict::Escalate(
-                        vec![EscalateReason::PolicyAsk(ask.rule.clone())],
+                        asks.into_iter().map(EscalateReason::PolicyAsk).collect(),
                         Approver::User,
                     )
                 } else {
@@ -560,7 +581,15 @@ impl Engine {
 
         // A grant lifts Escalate only. It is never consulted for Deny.
         if let (Verdict::Escalate(reasons, to), Some(grant)) = (&verdict, &req.approval)
-            && grant_lifts(&self.broker_keys, &self.bundle_id, req, grant, reasons, *to)
+            && grant_lifts(
+                &self.broker_keys,
+                self.max_grant_ttl,
+                &self.bundle_id,
+                req,
+                grant,
+                reasons,
+                *to,
+            )
         {
             verdict = Verdict::Allow { notify: true };
             record.approved = true;

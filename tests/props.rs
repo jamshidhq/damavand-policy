@@ -247,7 +247,9 @@ const PATTERNS: [(&str, Oracle); 5] = [
             && s.ends_with('y')
             && s[1..s.len() - 1].chars().all(|c| c.is_ascii_lowercase())
     }),
-    ("", |s| s.is_empty()),
+    ("[a-c]{2}", |s| {
+        s.len() == 2 && s.chars().all(|c| ('a'..='c').contains(&c))
+    }),
 ];
 
 /// Values aimed at the constraints: near misses, injection payloads, and
@@ -319,8 +321,9 @@ proptest! {
             .expect("constraints load");
         for (name, cleared) in [
             ("none", false),
-            ("e", choices.contains(&value)),
-            ("p", oracle(&value)),
+            // An empty tainted value is never cleared.
+            ("e", !value.is_empty() && choices.contains(&value)),
+            ("p", !value.is_empty() && oracle(&value)),
         ] {
             let d = e.decide(&req(p, v).autonomy_override(lvl)
                 .param(Param::untrusted(name, value.clone(), vec!["web".into()])));
@@ -365,7 +368,7 @@ proptest! {
                                            v in verb(), lvl in level(), tainted in any::<bool>(),
                                            a in prop::sample::select(vec![Approver::Child, Approver::Main, Approver::User]),
                                            ttl in 0u64..3, mutation in 0usize..9,
-                                           nonce in any::<[u8; 16]>(), run in "[a-z]{0,3}") {
+                                           nonce in any::<[u8; 16]>(), run in "[a-z]{1,3}") {
         let e = engine(&pols);
         let mut q = req(p, v).autonomy_override(lvl).run_id(run);
         if tainted {
@@ -429,7 +432,7 @@ proptest! {
         let orch = damavand_policy::Entity::new(r("Orchestrator", "o")).attr("depth", serde_json::json!(depth));
         let worker = damavand_policy::Entity::new(r("Worker", "w")).parent(r("Orchestrator", "o"));
         let principal = if as_principal { r("Orchestrator", "o") } else { r("Worker", "w") };
-        let q = DecisionRequest::new(principal, "j_read", common::lib(), NOW).entity(orch).entity(worker);
+        let q = DecisionRequest::new(principal, "j_read", common::lib(), "run-1", NOW).entity(orch).entity(worker);
         let d = e.decide(&q);
         let expected = match (depth.as_str(), as_principal) {
             ("main", false) => Some(Approver::Main),
@@ -479,7 +482,8 @@ proptest! {
     }
 
     /// A pattern that loads never clears a value holding a control
-    /// character, a bidi control or a shell metacharacter.
+    /// character, a format character (bidi controls, zero-width joiners), a
+    /// line or paragraph separator, or a shell metacharacter.
     #[test]
     fn loaded_patterns_reject_metacharacters(pattern in prop_oneof![
                                                  "[a-z.*+?|()\\[\\]^$-]{0,8}",
@@ -489,11 +493,12 @@ proptest! {
                                                      "[\\x00-\\x{10FFFF}]*", "(?i)[^b]+", "\\w+", "[a-z ]+",
                                                  ]).prop_map(String::from),
                                              ],
-                                             bad in prop::sample::select(vec!['\n', '\r', '\0', '\u{1b}', '\u{7f}', '\u{85}', '\u{202e}', '\u{2066}', '$', '`', ';', '|', '&', '<', '>', '\\', '"', '\'']),
+                                             bad in prop::sample::select(vec!['\n', '\r', '\0', '\u{1b}', '\u{7f}', '\u{85}', '\u{202e}', '\u{2066}',
+                                                                      '\u{200b}', '\u{200c}', '\u{200d}', '\u{2028}', '\u{2029}', '\u{61c}', '\u{feff}', '\u{e0041}', '$', '`', ';', '|', '&', '<', '>', '\\', '"', '\'']),
                                              pre in "[a-z]{0,3}", post in "[a-z]{0,3}") {
         let toml = format!("[j_edit.p]\npattern = {pattern:?}\n");
         match Engine::load(&common::bundle("@id(\"all\") permit (principal, action, resource);").with_constraints(toml)) {
-            Err(err) => prop_assert!(matches!(err, LoadError::PatternInvalid { .. } | LoadError::PatternTooBroad { .. } | LoadError::Constraints { .. }), "{err:?}"),
+            Err(err) => prop_assert!(matches!(err, LoadError::PatternInvalid { .. } | LoadError::PatternTooBroad { .. } | LoadError::PatternMatchesEmpty { .. } | LoadError::Constraints { .. }), "{err:?}"),
             Ok(e) => {
                 let value = format!("{pre}{bad}{post}");
                 let d = e.decide(&req("w1", VERBS[2]).param(Param::untrusted("p", value.clone(), vec![])));
@@ -559,7 +564,7 @@ proptest! {
                            attr in any::<i64>(), name in ".*", value in ".*", pattern in ".{0,40}",
                            budget in any::<(i64, i64)>(), lvl in prop::option::of(level())) {
         let e = engine(&[Pol { effect: Effect::Permit, p: P::Any, a: A::Any, r: R::Any }]);
-        let mut q = DecisionRequest::new(EntityRef::new(kind.clone(), eid.clone()), action, EntityRef::new(rkind, eid.clone()), common::NOW)
+        let mut q = DecisionRequest::new(EntityRef::new(kind.clone(), eid.clone()), action, EntityRef::new(rkind, eid.clone()), "run-1", common::NOW)
             .entity(damavand_policy::Entity::new(EntityRef::new(kind, eid)).attr("depth", serde_json::json!(attr)))
             .param(Param::untrusted(name, value, vec![pattern]))
             .budget(damavand_policy::Budget::new(budget.0, budget.1));

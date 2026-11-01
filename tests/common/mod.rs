@@ -137,7 +137,7 @@ pub fn request(
     action: &str,
     resource: EntityRef,
 ) -> damavand_policy::DecisionRequest {
-    let mut req = damavand_policy::DecisionRequest::new(principal, action, resource, NOW);
+    let mut req = damavand_policy::DecisionRequest::new(principal, action, resource, "run-1", NOW);
     for e in entities() {
         req = req.entity(e);
     }

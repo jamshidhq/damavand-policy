@@ -21,84 +21,85 @@ x-repo: &repo {type: Repo, id: jamshid}
 
 cases:
   - name: worker reads a repo file
-    request: {now: 1800000000, principal: *w1, action: j_read, resource: *lib, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_read, resource: *lib, entities: *ents}
     expect: {outcome: allow, notify: false}
 
   - name: project forbid beats global read permit
-    request: {now: 1800000000, principal: *w1, action: j_read, resource: {type: Path, id: "jamshid/.env"}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_read, resource: {type: Path, id: "jamshid/.env"}, entities: *ents}
     expect: {outcome: deny, rule: jamshid.no-read-env}
 
   - name: global forbid on a repo outside the project
-    request: {now: 1800000000, principal: *w1, action: j_read, resource: {type: Path, id: "vault/key"}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_read, resource: {type: Path, id: "vault/key"}, entities: *ents}
     expect: {outcome: deny, rule: global.no-vault-read}
 
   - name: L3 worktree edit allows and notifies
-    request: {now: 1800000000, principal: *w1, action: j_edit, resource: *lib, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_edit, resource: *lib, entities: *ents}
     expect: {outcome: allow, notify: true}
 
   - name: override L2 lowers an edit to approval by the user
-    request: {now: 1800000000, principal: *w1, action: j_edit, resource: *lib, entities: *ents, autonomyOverride: 2}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_edit, resource: *lib, entities: *ents, autonomyOverride: 2}
     expect: {outcome: escalate, reason: autonomyRequiresApproval, to: user}
 
   - name: override L1 denies an edit
-    request: {now: 1800000000, principal: *w1, action: j_edit, resource: *lib, entities: *ents, autonomyOverride: 1}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_edit, resource: *lib, entities: *ents, autonomyOverride: 1}
     expect: {outcome: deny, rule: damavand.autonomy}
 
   - name: loop cap is lower than the project cap
-    request: {now: 1800000000, principal: {type: Worker, id: w2}, action: j_edit, resource: *lib, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: {type: Worker, id: w2}, action: j_edit, resource: *lib, entities: *ents}
     expect: {outcome: deny, rule: damavand.autonomy}
 
   - name: override cannot raise the cap
-    request: {now: 1800000000, principal: {type: Worker, id: w2}, action: j_edit, resource: *lib, entities: *ents, autonomyOverride: 3}
+    request: {now: 1800000000, runId: run-1, principal: {type: Worker, id: w2}, action: j_edit, resource: *lib, entities: *ents, autonomyOverride: 3}
     expect: {outcome: deny, rule: damavand.autonomy}
 
   - name: L2 push escalates to the user
-    request: {now: 1800000000, principal: *w1, action: git_push, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: git_push, resource: *repo, entities: *ents}
     expect: {outcome: escalate, reason: autonomyRequiresApproval, to: user}
 
   - name: user grant lifts the push
-    request: {now: 1800000000, principal: *w1, action: git_push, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: git_push, resource: *repo, entities: *ents}
     grantFrom: user
     expect: {outcome: allow, notify: true}
 
   - name: grant from main is too low for a user escalation
-    request: {now: 1800000000, principal: *w1, action: git_push, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: git_push, resource: *repo, entities: *ents}
     grantFrom: main
     expect: {outcome: escalate, reason: autonomyRequiresApproval, to: user}
 
   - name: grant for another request does not match
-    request: {now: 1800000000, principal: *w1, action: git_push, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: git_push, resource: *repo, entities: *ents}
     foreignGrant:
       approver: user
       # Same principal, action, resource, entities and reasons; one more
       # parameter, so only the request digest differs.
-      request: {now: 1800000000, principal: *w1, action: git_push, resource: *repo, entities: *ents, params: [{name: force, value: "yes", taint: clean}]}
+      request: {now: 1800000000, runId: run-1, principal: *w1, action: git_push, resource: *repo, entities: *ents, params: [{name: force, value: "yes", taint: clean}]}
     expect: {outcome: escalate, reason: autonomyRequiresApproval, to: user}
 
   - name: global ask beats project allow
-    request: {now: 1800000000, principal: *w1, action: git_push, resource: {type: Repo, id: jamshid-release}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: git_push, resource: {type: Repo, id: jamshid-release}, entities: *ents}
     expect: {outcome: escalate, reason: policyAsk, rule: global.ask-push-release, to: user}
 
   - name: no permit escalates a worker to its child orchestrator
-    request: {now: 1800000000, principal: *w1, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
     expect: {outcome: escalate, reason: noMatch, to: child}
 
   - name: no permit escalates a child orchestrator to main
-    request: {now: 1800000000, principal: {type: Orchestrator, id: child}, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: {type: Orchestrator, id: child}, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
     expect: {outcome: escalate, reason: noMatch, to: main}
 
   - name: no permit escalates main to the user
-    request: {now: 1800000000, principal: {type: Orchestrator, id: main}, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: {type: Orchestrator, id: main}, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
     expect: {outcome: escalate, reason: noMatch, to: user}
 
   - name: child grant lifts a no-match escalation to child
-    request: {now: 1800000000, principal: *w1, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: draft_pr, resource: {type: Repo, id: vault}, entities: *ents}
     grantFrom: child
     expect: {outcome: allow, notify: true}
 
   - name: no match with a tainted parameter goes straight to the user
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: draft_pr
       resource: {type: Repo, id: vault}
@@ -107,29 +108,30 @@ cases:
     expect: {outcome: escalate, to: user}
 
   - name: egress cap L1 denies a permitted request
-    request: {now: 1800000000, principal: *w1, action: http_request, resource: {type: Host, id: crates.io}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: http_request, resource: {type: Host, id: crates.io}, entities: *ents}
     expect: {outcome: deny, rule: damavand.autonomy}
 
   - name: Never action is denied by the Rust gate
-    request: {now: 1800000000, principal: *w1, action: terraform_apply, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: terraform_apply, resource: *repo, entities: *ents}
     expect: {outcome: deny, rule: damavand.never}
 
   - name: Never action is denied even with a user grant
-    request: {now: 1800000000, principal: *w1, action: terraform_apply, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: terraform_apply, resource: *repo, entities: *ents}
     grantFrom: user
     expect: {outcome: deny, rule: damavand.never}
 
   - name: unknown action
-    request: {now: 1800000000, principal: *w1, action: rm_rf, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: rm_rf, resource: *repo, entities: *ents}
     expect: {outcome: deny, rule: damavand.unknown_action}
 
   - name: principal type not allowed for the action
-    request: {now: 1800000000, principal: {type: Host, id: h}, action: j_read, resource: *lib, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: {type: Host, id: h}, action: j_read, resource: *lib, entities: *ents}
     expect: {outcome: deny, rule: damavand.request_invalid}
 
   - name: entity attributes that do not match the schema
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_read
       resource: *lib
@@ -139,6 +141,7 @@ cases:
   - name: uncleared tainted parameter escalates an L3 edit
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -151,6 +154,7 @@ cases:
   - name: enum constraint clears a tainted parameter
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -161,6 +165,7 @@ cases:
   - name: enum constraint is exact
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -171,6 +176,7 @@ cases:
   - name: a bundle constraint is per action
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: draft_pr
       resource: *repo
@@ -181,6 +187,7 @@ cases:
   - name: anchored pattern clears a tainted parameter
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -191,6 +198,7 @@ cases:
   - name: pattern must match the whole value
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -201,6 +209,7 @@ cases:
   - name: alternation stays inside the anchors
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -211,6 +220,7 @@ cases:
   - name: a clean parameter needs no constraint
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -221,6 +231,7 @@ cases:
   - name: autonomy deny beats taint escalation
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -232,6 +243,7 @@ cases:
   - name: user grant lifts a taint escalation
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_edit
       resource: *lib
@@ -241,22 +253,23 @@ cases:
     expect: {outcome: allow, notify: true}
 
   - name: a grant never lifts a deny
-    request: {now: 1800000000, principal: *w1, action: j_read, resource: {type: Path, id: "jamshid/.env"}, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_read, resource: {type: Path, id: "jamshid/.env"}, entities: *ents}
     grantFrom: user
     expect: {outcome: deny, rule: jamshid.no-read-env}
 
   - name: context reaches policies
-    request: {now: 1800000000, principal: *w1, action: j_read, resource: *lib, entities: *ents, budget: {tokensLeft: 10, actionsLeft: -1}}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: j_read, resource: *lib, entities: *ents, budget: {tokensLeft: 10, actionsLeft: -1}}
     expect: {outcome: deny, rule: global.budget-exhausted}
 
   - name: an expired grant does not lift
-    request: {now: 1800000000, principal: *w1, action: git_push, resource: *repo, entities: *ents}
+    request: {now: 1800000000, runId: run-1, principal: *w1, action: git_push, resource: *repo, entities: *ents}
     expiredGrantFrom: user
     expect: {outcome: escalate, reason: autonomyRequiresApproval, to: user}
 
   - name: L2 with a tainted parameter shows the taint first
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: git_push
       resource: *repo
@@ -267,6 +280,7 @@ cases:
   - name: an orchestrator depth the core does not build is refused
     request:
       now: 1800000000
+      runId: run-1
       principal: *w1
       action: j_read
       resource: *lib
